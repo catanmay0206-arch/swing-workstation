@@ -12,9 +12,19 @@ st.set_page_config(
 )
 
 # --- UNIVERSE DICTIONARIES ---
-NIFTY_50 = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS", "LT.NS", "M&M.NS", "TATAMOTORS.NS", "SBIN.NS", "AXISBANK.NS", "ITC.NS", "SUNPHARMA.NS", "TITAN.NS", "BAJFINANCE.NS", "KOTAKBANK.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "HAL.NS"]
+NIFTY_50 = [
+    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", 
+    "BHARTIARTL.NS", "LT.NS", "M&M.NS", "TATAMOTORS.NS", "SBIN.NS", 
+    "AXISBANK.NS", "ITC.NS", "SUNPHARMA.NS", "TITAN.NS", "BAJFINANCE.NS", 
+    "KOTAKBANK.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "HAL.NS"
+]
 
-NIFTY_200 = NIFTY_50 + ["ZOMATO.NS", "JIOFIN.NS", "IRFC.NS", "BHEL.NS", "VBL.NS", "TRENT.NS", "BEL.NS", "PFC.NS", "REC.NS", "COALINDIA.NS", "TATAPOWER.NS", "GAIL.NS", "DLF.NS", "IOC.NS", "VEDL.NS", "HINDALCO.NS", "SIEMENS.NS", "ABB.NS", "PIDILITIND.NS", "CHOLAFIN.NS"]
+NIFTY_200 = NIFTY_50 + [
+    "ZOMATO.NS", "JIOFIN.NS", "IRFC.NS", "BHEL.NS", "VBL.NS", 
+    "TRENT.NS", "BEL.NS", "PFC.NS", "REC.NS", "COALINDIA.NS", 
+    "TATAPOWER.NS", "GAIL.NS", "DLF.NS", "IOC.NS", "VEDL.NS", 
+    "HINDALCO.NS", "SIEMENS.NS", "ABB.NS", "PIDILITIND.NS", "CHOLAFIN.NS"
+]
 
 SECTOR_CONSTITUENTS = {
     "Nifty Bank": ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "INDUSINDBK.NS", "PNB.NS", "BANKBARODA.NS"],
@@ -26,7 +36,17 @@ SECTOR_CONSTITUENTS = {
     "Nifty Energy": ["RELIANCE.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "BPCL.NS", "GAIL.NS", "IOC.NS", "TATAPOWER.NS"]
 }
 
-# --- DATA FETCHING ENGINE ---
+# --- CACHED DATA FETCHING ENGINE ---
+@st.cache_data(ttl=900)
+def fetch_stock_data(tickers_tuple):
+    """Fetches stock data using 6mo period and caches results for 15 mins."""
+    try:
+        tickers_list = list(tickers_tuple)
+        data = yf.download(tickers_list, period="6mo", progress=False, group_by="ticker")
+        return data
+    except Exception:
+        return pd.DataFrame()
+
 def get_sector_momentum():
     sectors = {
         "Nifty Bank": "BANKBEES.NS",
@@ -44,32 +64,38 @@ def get_sector_momentum():
     }
     
     results = []
-    try:
-        tickers = list(sectors.values())
-        data = yf.download(tickers, period="6m", progress=False)
-        
-        if not data.empty:
-            close_df = data['Close'] if 'Close' in data else data
-            for name, ticker in sectors.items():
-                if ticker in close_df.columns:
-                    series = close_df[ticker].dropna()
-                    if len(series) >= 20:
-                        curr = float(series.iloc[-1])
-                        val_30 = float(series.iloc[-22]) if len(series) >= 22 else float(series.iloc[0])
-                        val_90 = float(series.iloc[-65]) if len(series) >= 65 else float(series.iloc[0])
-                        
-                        ret_30 = ((curr - val_30) / val_30) * 100
-                        ret_90 = ((curr - val_90) / val_90) * 100
-                        
-                        results.append({
-                            "Sector": name,
-                            "Benchmark Ticker": ticker,
-                            "30D Return (%)": round(ret_30, 2),
-                            "90D Return (%)": round(ret_90, 2),
-                            "Current Price (₹)": round(curr, 2)
-                        })
-    except Exception:
-        pass
+    tickers = list(sectors.values())
+    data = fetch_stock_data(tuple(tickers))
+    
+    if not data.empty:
+        for name, ticker in sectors.items():
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    if ticker in data.columns.levels[0]:
+                        df_t = data[ticker].dropna()
+                    else:
+                        continue
+                else:
+                    df_t = data.dropna()
+                    
+                if 'Close' in df_t.columns and len(df_t) >= 20:
+                    series = df_t['Close']
+                    curr = float(series.iloc[-1])
+                    val_30 = float(series.iloc[-22]) if len(series) >= 22 else float(series.iloc[0])
+                    val_90 = float(series.iloc[-65]) if len(series) >= 65 else float(series.iloc[0])
+                    
+                    ret_30 = ((curr - val_30) / val_30) * 100
+                    ret_90 = ((curr - val_90) / val_90) * 100
+                    
+                    results.append({
+                        "Sector": name,
+                        "Benchmark Ticker": ticker,
+                        "30D Return (%)": round(ret_30, 2),
+                        "90D Return (%)": round(ret_90, 2),
+                        "Current Price (₹)": round(curr, 2)
+                    })
+            except Exception:
+                pass
 
     if not results:
         fallback_data = [
@@ -151,11 +177,14 @@ with tab2:
         ])
     
     if universe_choice == "Custom Stock Search":
-        custom_input = st.text_input("Enter NSE Stock Symbols (separated by commas)", "TATASTEEL.NS, IRFC.NS, BHEL.NS, ZOMATO.NS")
-        scan_list = [s.strip().upper() for s in custom_input.split(",") if s.strip()]
-        for idx, s in enumerate(scan_list):
-            if not s.endswith(".NS") and not s.endswith(".BO"):
-                scan_list[idx] = s + ".NS"
+        custom_input = st.text_input("Enter NSE Stock Symbols (comma separated)", "TATASTEEL.NS, IRFC.NS, BHEL.NS, ZOMATO.NS")
+        raw_list = [s.strip().upper() for s in custom_input.split(",") if s.strip()]
+        scan_list = []
+        for item in raw_list:
+            clean_item = item.replace(" ", "")
+            if not clean_item.endswith(".NS") and not clean_item.endswith(".BO"):
+                clean_item += ".NS"
+            scan_list.append(clean_item)
     elif universe_choice == "Nifty 200 Momentum Stocks":
         scan_list = NIFTY_200
     else:
@@ -165,32 +194,42 @@ with tab2:
         screener_results = []
         progress_bar = st.progress(0)
         
+        all_data = fetch_stock_data(tuple(scan_list))
+        
         for idx, ticker in enumerate(scan_list):
             try:
-                df = yf.download(ticker, period="6m", progress=False)
-                if not df.empty and len(df) >= 30:
-                    close_s = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
-                    vol_s = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
-                    
-                    ema50 = close_s.ewm(span=50, adjust=False).mean()
-                    vol_avg20 = vol_s.rolling(window=20).mean()
-                    
-                    last_close = float(close_s.iloc[-1])
-                    last_ema50 = float(ema50.iloc[-1])
-                    vol_curr = float(vol_s.iloc[-1])
-                    vol_avg = float(vol_avg20.iloc[-1])
-                    
-                    vol_surge = vol_curr >= (1.1 * vol_avg)
-                    trend_ok = last_close > last_ema50
-                    
-                    if trend_ok and vol_surge:
-                        screener_results.append({
-                            "Symbol": ticker.replace(".NS", ""),
-                            "Close Price (₹)": round(last_close, 2),
-                            "50 EMA Support": round(last_ema50, 2),
-                            "Volume Surge": f"{round(vol_curr/vol_avg, 2)}x",
-                            "Confluence Status": "🟢 HIGH PROBABILITY BUY"
-                        })
+                if not all_data.empty:
+                    if isinstance(all_data.columns, pd.MultiIndex):
+                        if ticker in all_data.columns.levels[0]:
+                            df_stock = all_data[ticker].dropna()
+                        else:
+                            df_stock = pd.DataFrame()
+                    else:
+                        df_stock = all_data.dropna()
+                        
+                    if not df_stock.empty and 'Close' in df_stock.columns and len(df_stock) >= 30:
+                        close_s = df_stock['Close']
+                        vol_s = df_stock['Volume']
+                        
+                        ema50 = close_s.ewm(span=50, adjust=False).mean()
+                        vol_avg20 = vol_s.rolling(window=20).mean()
+                        
+                        last_close = float(close_s.iloc[-1])
+                        last_ema50 = float(ema50.iloc[-1])
+                        vol_curr = float(vol_s.iloc[-1])
+                        vol_avg = float(vol_avg20.iloc[-1])
+                        
+                        vol_surge = vol_curr >= (1.1 * vol_avg)
+                        trend_ok = last_close > last_ema50
+                        
+                        if trend_ok and vol_surge:
+                            screener_results.append({
+                                "Symbol": ticker.replace(".NS", ""),
+                                "Close Price (₹)": round(last_close, 2),
+                                "50 EMA Support": round(last_ema50, 2),
+                                "Volume Surge": f"{round(vol_curr/vol_avg, 2)}x",
+                                "Confluence Status": "🟢 HIGH PROBABILITY BUY"
+                            })
             except Exception:
                 pass
             progress_bar.progress((idx + 1) / len(scan_list))
@@ -198,7 +237,7 @@ with tab2:
         if screener_results:
             st.dataframe(pd.DataFrame(screener_results), use_container_width=True)
         else:
-            st.warning("No stocks in the selected list currently meet all confluence criteria.")
+            st.info("No stocks in the selected list currently meet all confluence criteria.")
 
 # --- TAB 3: INTERACTIVE HOLDINGS ENGINE ---
 with tab3:
