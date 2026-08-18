@@ -3,6 +3,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import time
+import random
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -36,15 +38,33 @@ SECTOR_CONSTITUENTS = {
     "Nifty Energy": ["RELIANCE.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "BPCL.NS", "GAIL.NS", "IOC.NS", "TATAPOWER.NS"]
 }
 
-# --- CACHED DATA FETCHING ENGINE ---
+# --- CACHED DATA FETCHING ENGINE (WITH RATE LIMIT PROTECTION) ---
 @st.cache_data(ttl=900)
 def fetch_stock_data(tickers_tuple):
-    """Fetches stock data using 6mo period and caches results for 15 mins."""
+    """Fetches stock data in batches with rate-limit protection."""
+    tickers_list = list(tickers_tuple)
+    if not tickers_list:
+        return pd.DataFrame()
+    
     try:
-        tickers_list = list(tickers_tuple)
+        # First attempt: Batch download
         data = yf.download(tickers_list, period="6mo", progress=False, group_by="ticker")
         return data
     except Exception:
+        # Fallback: Sequential download with delay if Yahoo limits batching
+        all_data = {}
+        for ticker in tickers_list:
+            try:
+                time.sleep(random.uniform(0.3, 0.8))
+                df = yf.download(ticker, period="6mo", progress=False)
+                if not df.empty:
+                    df.columns = pd.MultiIndex.from_product([[ticker], df.columns])
+                    all_data[ticker] = df
+            except Exception:
+                pass
+        
+        if all_data:
+            return pd.concat(all_data.values(), axis=1)
         return pd.DataFrame()
 
 def get_sector_momentum():
@@ -177,7 +197,7 @@ with tab2:
         ])
     
     if universe_choice == "Custom Stock Search":
-        custom_input = st.text_input("Enter NSE Stock Symbols (comma separated)", "TATASTEEL.NS, IRFC.NS, BHEL.NS, ZOMATO.NS")
+        custom_input = st.text_input("Enter NSE Stock Symbols (comma separated)", "TATASTEEL, IRFC, BHEL, ZOMATO")
         raw_list = [s.strip().upper() for s in custom_input.split(",") if s.strip()]
         scan_list = []
         for item in raw_list:
