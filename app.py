@@ -11,7 +11,22 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- GUARANTEED DATA FETCHING ENGINE ---
+# --- UNIVERSE DICTIONARIES ---
+NIFTY_50 = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS", "LT.NS", "M&M.NS", "TATAMOTORS.NS", "SBIN.NS", "AXISBANK.NS", "ITC.NS", "SUNPHARMA.NS", "TITAN.NS", "BAJFINANCE.NS", "KOTAKBANK.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "HAL.NS"]
+
+NIFTY_200 = NIFTY_50 + ["ZOMATO.NS", "JIOFIN.NS", "IRFC.NS", "BHEL.NS", "VBL.NS", "TRENT.NS", "BEL.NS", "PFC.NS", "REC.NS", "COALINDIA.NS", "TATAPOWER.NS", "GAIL.NS", "DLF.NS", "IOC.NS", "VEDL.NS", "HINDALCO.NS", "SIEMENS.NS", "ABB.NS", "PIDILITIND.NS", "CHOLAFIN.NS"]
+
+SECTOR_CONSTITUENTS = {
+    "Nifty Bank": ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "INDUSINDBK.NS", "PNB.NS", "BANKBARODA.NS"],
+    "Nifty Auto": ["M&M.NS", "TATAMOTORS.NS", "MARUTI.NS", "BAJAJ-AUTO.NS", "HEROMOTOCO.NS", "EICHERMOT.NS", "TVSMOTOR.NS", "BHARATFORG.NS"],
+    "Nifty IT": ["TCS.NS", "INFY.NS", "HCLTECH.NS", "WIPRO.NS", "LTIM.NS", "TECHM.NS", "PERSISTENT.NS", "COFORGE.NS"],
+    "Nifty Pharma": ["SUNPHARMA.NS", "CIPLA.NS", "DRREDDY.NS", "DIVISLAB.NS", "LUPIN.NS", "TORNTPHARM.NS", "MANKIND.NS", "ZYDUSLIFE.NS"],
+    "Nifty FMCG": ["ITC.NS", "HINDUNILVR.NS", "NESTLEIND.NS", "BRITANNIA.NS", "TATACONSUM.NS", "VBL.NS", "GODREJCP.NS", "DABUR.NS"],
+    "Nifty Metal": ["TATASTEEL.NS", "HINDALCO.NS", "JSL.NS", "JSWSTEEL.NS", "VEDL.NS", "JINDALSTEL.NS", "NATIONALUM.NS", "NMDC.NS"],
+    "Nifty Energy": ["RELIANCE.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "BPCL.NS", "GAIL.NS", "IOC.NS", "TATAPOWER.NS"]
+}
+
+# --- DATA FETCHING ENGINE ---
 def get_sector_momentum():
     sectors = {
         "Nifty Bank": "BANKBEES.NS",
@@ -29,19 +44,12 @@ def get_sector_momentum():
     }
     
     results = []
-    
-    # Live Yahoo Finance Fetching
     try:
         tickers = list(sectors.values())
         data = yf.download(tickers, period="6m", progress=False)
         
         if not data.empty:
-            # Extract close prices cleanly
-            if 'Close' in data:
-                close_df = data['Close']
-            else:
-                close_df = data
-                
+            close_df = data['Close'] if 'Close' in data else data
             for name, ticker in sectors.items():
                 if ticker in close_df.columns:
                     series = close_df[ticker].dropna()
@@ -63,7 +71,6 @@ def get_sector_momentum():
     except Exception:
         pass
 
-    # Backup Sector Matrix (Ensures table is never empty)
     if not results:
         fallback_data = [
             {"Sector": "Nifty Auto", "Benchmark Ticker": "AUTOBEES.NS", "30D Return (%)": 6.85, "90D Return (%)": 14.20, "Current Price (₹)": 245.10},
@@ -71,13 +78,7 @@ def get_sector_momentum():
             {"Sector": "Nifty IT", "Benchmark Ticker": "ITBEES.NS", "30D Return (%)": 3.40, "90D Return (%)": 11.50, "Current Price (₹)": 412.30},
             {"Sector": "Nifty Metal", "Benchmark Ticker": "TATASTEEL.NS", "30D Return (%)": 2.15, "90D Return (%)": 6.30, "Current Price (₹)": 158.20},
             {"Sector": "Nifty Energy", "Benchmark Ticker": "RELIANCE.NS", "30D Return (%)": 1.80, "90D Return (%)": 5.10, "Current Price (₹)": 2980.00},
-            {"Sector": "Nifty Pharma", "Benchmark Ticker": "PHARMABEES.NS", "30D Return (%)": 0.95, "90D Return (%)": 7.40, "Current Price (₹)": 112.50},
-            {"Sector": "Nifty Realty", "Benchmark Ticker": "DLF.NS", "30D Return (%)": -0.45, "90D Return (%)": 4.80, "Current Price (₹)": 845.00},
-            {"Sector": "Nifty Infra", "Benchmark Ticker": "LT.NS", "30D Return (%)": -1.20, "90D Return (%)": 3.10, "Current Price (₹)": 3610.00},
-            {"Sector": "Nifty FMCG", "Benchmark Ticker": "HINDUNILVR.NS", "30D Return (%)": -1.85, "90D Return (%)": 1.20, "Current Price (₹)": 2490.00},
-            {"Sector": "Nifty Commodities", "Benchmark Ticker": "CPSEETF.NS", "30D Return (%)": -2.10, "90D Return (%)": 2.50, "Current Price (₹)": 94.30},
-            {"Sector": "Nifty PSE", "Benchmark Ticker": "SBIN.NS", "30D Return (%)": -2.80, "90D Return (%)": 0.80, "Current Price (₹)": 815.00},
-            {"Sector": "Nifty Media", "Benchmark Ticker": "ZEEL.NS", "30D Return (%)": -4.30, "90D Return (%)": -8.10, "Current Price (₹)": 134.20}
+            {"Sector": "Nifty Pharma", "Benchmark Ticker": "PHARMABEES.NS", "30D Return (%)": 0.95, "90D Return (%)": 7.40, "Current Price (₹)": 112.50}
         ]
         res_df = pd.DataFrame(fallback_data)
     else:
@@ -113,13 +114,13 @@ else:
 # --- MAIN DASHBOARD TABS ---
 st.title("🏛️ Institutional Swing Workstation")
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Sector Heatmap & Macro", 
-    "🔍 High-Probability Screener", 
-    "📈 Holdings & Smart Exit", 
+    "📊 Sector Heatmap & Constituents", 
+    "🔍 Confluence Screener & Search", 
+    "📈 Interactive Holdings Exit Engine", 
     "📑 Reporting Center"
 ])
 
-# --- TAB 1: SECTOR HEATMAP ---
+# --- TAB 1: SECTOR HEATMAP & CONSTITUENTS ---
 with tab1:
     st.subheader("Top-Down 12-Sector Momentum Heatmap")
     
@@ -129,35 +130,53 @@ with tab1:
         st.dataframe(sector_df, use_container_width=True)
             
     with col_b:
-        st.subheader("💡 Macro Engine Guidance")
-        st.info(
-            "**Current Macro Thesis:** Sector rotation actively favors capital deployment into high-momentum sectors. "
-            "Focus scans strictly on top-ranked sectors (Ranks 1–3) with 30D relative outperformance."
-        )
+        st.subheader("💡 Sector Stock Explorer")
+        selected_sec = st.selectbox("Select Sector to View Stocks", list(SECTOR_CONSTITUENTS.keys()))
+        sec_stocks = pd.DataFrame({
+            "Constituent Stock": SECTOR_CONSTITUENTS[selected_sec]
+        })
+        sec_stocks["NSE Symbol"] = sec_stocks["Constituent Stock"]
+        st.dataframe(sec_stocks[["NSE Symbol"]], use_container_width=True)
 
-# --- TAB 2: HIGH-PROBABILITY SCREENER ---
+# --- TAB 2: HIGH-PROBABILITY SCREENER & SEARCH ---
 with tab2:
-    st.subheader("Nifty Confluence Screener")
-    watchlist = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS", "LT.NS", "M&M.NS", "TATAMOTORS.NS", "SBIN.NS"]
+    st.subheader("Market Screener & Stock Search")
     
-    if st.button("Run Confluence Scan"):
+    col_s1, col_s2 = st.columns([1, 2])
+    with col_s1:
+        universe_choice = st.selectbox("Select Scanning Universe", [
+            "Nifty 50 Universe", 
+            "Nifty 200 Momentum Stocks", 
+            "Custom Stock Search"
+        ])
+    
+    if universe_choice == "Custom Stock Search":
+        custom_input = st.text_input("Enter NSE Stock Symbols (separated by commas)", "TATASTEEL.NS, IRFC.NS, BHEL.NS, ZOMATO.NS")
+        scan_list = [s.strip().upper() for s in custom_input.split(",") if s.strip()]
+        for idx, s in enumerate(scan_list):
+            if not s.endswith(".NS") and not s.endswith(".BO"):
+                scan_list[idx] = s + ".NS"
+    elif universe_choice == "Nifty 200 Momentum Stocks":
+        scan_list = NIFTY_200
+    else:
+        scan_list = NIFTY_50
+
+    if st.button(f"Run Confluence Scan ({len(scan_list)} Stocks)"):
         screener_results = []
         progress_bar = st.progress(0)
         
-        for idx, ticker in enumerate(watchlist):
+        for idx, ticker in enumerate(scan_list):
             try:
                 df = yf.download(ticker, period="6m", progress=False)
-                if not df.empty:
+                if not df.empty and len(df) >= 30:
                     close_s = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
                     vol_s = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
                     
                     ema50 = close_s.ewm(span=50, adjust=False).mean()
-                    ema200 = close_s.ewm(span=200, adjust=False).mean()
                     vol_avg20 = vol_s.rolling(window=20).mean()
                     
                     last_close = float(close_s.iloc[-1])
                     last_ema50 = float(ema50.iloc[-1])
-                    last_ema200 = float(ema200.iloc[-1])
                     vol_curr = float(vol_s.iloc[-1])
                     vol_avg = float(vol_avg20.iloc[-1])
                     
@@ -167,50 +186,69 @@ with tab2:
                     if trend_ok and vol_surge:
                         screener_results.append({
                             "Symbol": ticker.replace(".NS", ""),
-                            "Close (₹)": round(last_close, 2),
-                            "50 EMA": round(last_ema50, 2),
-                            "200 EMA": round(last_ema200, 2),
-                            "Vol Ratio": f"{round(vol_curr/vol_avg, 2)}x",
-                            "Signal": "🟢 STRONG BUY"
+                            "Close Price (₹)": round(last_close, 2),
+                            "50 EMA Support": round(last_ema50, 2),
+                            "Volume Surge": f"{round(vol_curr/vol_avg, 2)}x",
+                            "Confluence Status": "🟢 HIGH PROBABILITY BUY"
                         })
             except Exception:
                 pass
-            progress_bar.progress((idx + 1) / len(watchlist))
+            progress_bar.progress((idx + 1) / len(scan_list))
             
         if screener_results:
             st.dataframe(pd.DataFrame(screener_results), use_container_width=True)
         else:
-            st.warning("No stocks currently meet all confluence criteria.")
+            st.warning("No stocks in the selected list currently meet all confluence criteria.")
 
-# --- TAB 3: HOLDINGS MONITOR ---
+# --- TAB 3: INTERACTIVE HOLDINGS ENGINE ---
 with tab3:
-    st.subheader("Active Holdings Exit Engine")
+    st.subheader("Manage Active Portfolio & Automated Smart Exits")
+    st.caption("👇 Double click cells in the table below to edit or add your own stock holdings!")
     
-    sample_holdings = pd.DataFrame([
-        {"Symbol": "M&M", "Buy Price": 2800.0, "Current Price": 3150.0, "50 EMA": 2950.0, "RSI": 68},
-        {"Symbol": "TCS", "Buy Price": 3900.0, "Current Price": 4400.0, "50 EMA": 4100.0, "RSI": 82},
-        {"Symbol": "HDFCBANK", "Buy Price": 1650.0, "Current Price": 1590.0, "50 EMA": 1620.0, "RSI": 41}
-    ])
+    if "my_holdings" not in st.session_state:
+        st.session_state["my_holdings"] = pd.DataFrame([
+            {"Symbol": "M&M", "Buy Price": 2800.0, "Current Price": 3150.0, "50 EMA": 2950.0, "RSI": 68},
+            {"Symbol": "TCS", "Buy Price": 3900.0, "Current Price": 4400.0, "50 EMA": 4100.0, "RSI": 82},
+            {"Symbol": "HDFCBANK", "Buy Price": 1650.0, "Current Price": 1590.0, "50 EMA": 1620.0, "RSI": 41}
+        ])
+        
+    edited_df = st.data_editor(st.session_state["my_holdings"], num_rows="dynamic", use_container_width=True)
     
     actions = []
     reasons = []
+    pnl_list = []
     
-    for _, row in sample_holdings.iterrows():
-        if row["Current Price"] < row["50 EMA"]:
-            actions.append("🔴 CUT LOSS")
-            reasons.append("Price closed below 50 EMA Support")
-        elif row["RSI"] >= 80:
-            actions.append("🎯 BOOK PROFIT")
-            reasons.append("Overbought RSI condition (>80)")
-        else:
-            actions.append("🟢 HOLD & TRAIL")
-            reasons.append("Trend intact above 50 EMA")
+    for _, row in edited_df.iterrows():
+        try:
+            buy_p = float(row["Buy Price"])
+            curr_p = float(row["Current Price"])
+            ema_p = float(row["50 EMA"])
+            rsi_val = float(row["RSI"])
             
-    sample_holdings["P&L (%)"] = round(((sample_holdings["Current Price"] - sample_holdings["Buy Price"]) / sample_holdings["Buy Price"]) * 100, 2)
-    sample_holdings["Smart Action"] = actions
-    sample_holdings["Reasoning"] = reasons
+            pnl = round(((curr_p - buy_p) / buy_p) * 100, 2) if buy_p > 0 else 0.0
+            pnl_list.append(f"{pnl}%")
+            
+            if curr_p < ema_p:
+                actions.append("🔴 CUT LOSS")
+                reasons.append("Price closed below 50 EMA Support")
+            elif rsi_val >= 80:
+                actions.append("🎯 BOOK PROFIT")
+                reasons.append("RSI strictly overbought (>80)")
+            else:
+                actions.append("🟢 HOLD & TRAIL")
+                reasons.append("Bullish trend intact above 50 EMA")
+        except Exception:
+            actions.append("⚠️ INCOMPLETE DATA")
+            reasons.append("Please enter valid prices")
+            pnl_list.append("N/A")
+            
+    edited_df["P&L (%)"] = pnl_list
+    edited_df["Smart Action Signal"] = actions
+    edited_df["Signal Reason"] = reasons
     
-    st.dataframe(sample_holdings, use_container_width=True)
+    st.markdown("---")
+    st.subheader("📋 Active Holdings Evaluation Matrix")
+    st.dataframe(edited_df, use_container_width=True)
 
 # --- TAB 4: REPORTING CENTER ---
 with tab4:
@@ -223,7 +261,7 @@ with tab4:
     ])
     
     if report_type == "Master Portfolio & Smart Signals":
-        export_df = sample_holdings
+        export_df = edited_df
     elif report_type == "Sector Rotation & Momentum Rankings":
         export_df = get_sector_momentum()
     else:
