@@ -132,13 +132,45 @@ def fetch_screener_fundamentals(ticker):
             roce = parse_num(ratios.get("roce"))
             de = parse_num(ratios.get("debt to equity"))
 
-            rev_growth = None
+            def table_after_heading(heading_text):
+                node = soup.find(string=re.compile(re.escape(heading_text)))
+                if not node:
+                    return None
+                el = node.find_parent()
+                table = el.find_next("table") if el else None
+                if not table:
+                    return None
+                try:
+                    dfs = pd.read_html(io.StringIO(str(table)))
+                    return dfs[0] if dfs else None
+                except Exception:
+                    return None
+
+            def growth_3yr(heading_text):
+                df = table_after_heading(heading_text)
+                if df is None or df.shape[1] != 2:
+                    return None
+                mask = df.iloc[:, 0].astype(str).str.contains("3 Years", na=False)
+                if not mask.any():
+                    return None
+                return parse_num(str(df[mask].iloc[0, 1]))
+
+            rev_growth = growth_3yr("Compounded Sales Growth")
+            pat_growth = growth_3yr("Compounded Profit Growth")
+
+            fii_dii_qoq = None
             try:
-                for df in pd.read_html(io.StringIO(html)):
-                    if df.shape[1] == 2 and df.iloc[:, 0].astype(str).str.contains("3 Years", na=False).any():
-                        row = df[df.iloc[:, 0].astype(str).str.contains("3 Years", na=False)]
-                        rev_growth = parse_num(str(row.iloc[0, 1]))
-                        break  # first match in document order is Compounded Sales Growth
+                shp_df = table_after_heading("Shareholding Pattern")
+                if shp_df is not None and shp_df.shape[1] >= 3:
+                    shp_df = shp_df.set_index(shp_df.columns[0])
+                    fii_row = shp_df[shp_df.index.astype(str).str.contains("FIIs", na=False)]
+                    dii_row = shp_df[shp_df.index.astype(str).str.contains("DIIs", na=False)]
+                    if not fii_row.empty and not dii_row.empty:
+                        last2 = shp_df.columns[-2:]
+                        fii_now, fii_prev = parse_num(str(fii_row[last2[1]].iloc[0])), parse_num(str(fii_row[last2[0]].iloc[0]))
+                        dii_now, dii_prev = parse_num(str(dii_row[last2[1]].iloc[0])), parse_num(str(dii_row[last2[0]].iloc[0]))
+                        if None not in (fii_now, fii_prev, dii_now, dii_prev):
+                            fii_dii_qoq = round((fii_now - fii_prev) + (dii_now - dii_prev), 2)
             except Exception:
                 pass
 
@@ -147,6 +179,8 @@ def fetch_screener_fundamentals(ticker):
                     "name": name, "sector": "N/A",
                     "pe": pe, "roe": (roe or roce) / 100 if (roe or roce) else None,
                     "de": de, "rev_growth": (rev_growth / 100) if rev_growth is not None else None,
+                    "pat_growth": (pat_growth / 100) if pat_growth is not None else None,
+                    "fii_dii_qoq": fii_dii_qoq,
                     "_source": "Screener.in",
                 }, None
         except Exception as e:
@@ -235,20 +269,41 @@ def analyze_technical(df):
             score -= 15
             points.append(f"Price below 200-EMA ₹{ema200:.0f} — long-term trend weak")
 
+    # RSI: on a strong 6-month trend, high RSI reflects real institutional buying,
+    # not automatically a penalty — unless the latest candle shows a bearish
+    # reversal (red body with a long upper wick rejecting higher prices).
+    last = df.iloc[-1]
+    is_red = last["Close"] < last["Open"]
+    body = abs(last["Close"] - last["Open"])
+    upper_wick = last["High"] - max(last["Close"], last["Open"])
+    bearish_reversal = bool(is_red and body > 0 and upper_wick > body)
+
     if rsi is not None:
-        if 45 <= rsi <= 70:
+        if rsi > 70:
+            if bearish_reversal:
+                score -= 8
+                points.append(f"RSI(14) {rsi:.0f} but today's candle shows a bearish reversal — momentum may be fading")
+            else:
+                score += 12
+                points.append(f"RSI(14) {rsi:.0f} — strong breakout momentum, no reversal signal yet")
+        elif 45 <= rsi <= 70:
             score += 10
             points.append(f"RSI(14) {rsi:.0f} — healthy momentum")
-        elif rsi > 80:
-            score -= 10
-            points.append(f"RSI(14) {rsi:.0f} — overbought, pullback risk")
         elif rsi < 35:
             score -= 10
             points.append(f"RSI(14) {rsi:.0f} — weak momentum")
-        elif rsi > 70:
-            points.append(f"RSI(14) {rsi:.0f} — firm momentum, watch for overheating")
         else:
             points.append(f"RSI(14) {rsi:.0f} — flat/consolidating momentum")
+
+    # Volume surge on breakout: current volume vs 20-day average.
+    vol_ratio = None
+    if len(df) >= 20:
+        avg_vol20 = float(df["Volume"].iloc[-20:].mean())
+        if avg_vol20:
+            vol_ratio = float(df["Volume"].iloc[-1]) / avg_vol20
+            if vol_ratio >= 1.5:
+                score += 10
+                points.append(f"Volume {vol_ratio:.1f}x the 20-day average — breakout has real participation")
 
     if len(points) < 3 and atr_pct is not None:
         points.append(f"ATR(14) {atr_pct:.1f}% of price — {'high' if atr_pct > 5 else 'moderate' if atr_pct > 2 else 'low'} daily volatility")
@@ -268,12 +323,18 @@ def analyze_technical(df):
     else:
         trend = "Limited history"
 
+    # Two consecutive closes below the 50-EMA, not just one — avoids getting
+    # shaken out by a single intraday/closing wick.
+    ema50_series = close.ewm(span=50, adjust=False).mean()
+    two_day_break = bool(len(close) >= 2 and close.iloc[-1] < ema50_series.iloc[-1] and close.iloc[-2] < ema50_series.iloc[-2])
+
     return {
-        "score": score, "points": points[:4], "price": round(price, 2),
+        "score": score, "points": points[:5], "price": round(price, 2),
         "ema50": round(ema50, 2), "ema150": round(ema150, 2) if ema150 else None,
         "ema200": round(ema200, 2) if ema200 else None,
         "rsi": round(rsi, 1) if rsi is not None else None, "atr_pct": atr_pct,
-        "trend": trend, "full_stack": full_stack,
+        "vol_ratio": round(vol_ratio, 2) if vol_ratio else None,
+        "trend": trend, "full_stack": full_stack, "two_day_break": two_day_break,
     }
 
 
@@ -285,16 +346,47 @@ def analyze_fundamental(f):
         return None
     score = 50
     points = []
+
     pe = f.get("pe")
-    if pe:
-        if pe < 20:
-            score += 12
-            points.append(f"P/E {pe:.1f} — reasonably valued")
-        elif pe < 40:
-            points.append(f"P/E {pe:.1f} — moderately rich valuation")
+    pat = f.get("pat_growth")
+    is_proxy = False
+    if pat is None and f.get("rev_growth") is not None:
+        pat = f.get("rev_growth")
+        is_proxy = True
+    pat_pct = pat * 100 if pat is not None else None
+    pat_label = "Revenue growth (PAT proxy)" if is_proxy else "PAT growth"
+
+    # PEG (P/E ÷ growth rate) instead of a flat low-P/E preference — a rich P/E
+    # backed by fast PAT growth is a momentum leader, not a red flag. Falls back
+    # to a softer P/E-only read only when growth data isn't available at all.
+    if pe and pat_pct and pat_pct > 0:
+        peg = pe / pat_pct
+        if peg < 1.5:
+            score += 14
+            points.append(f"PEG {peg:.2f} (P/E {pe:.1f} ÷ {pat_label.lower()} {pat_pct:.0f}%) — growth justifies valuation")
+        elif peg < 3:
+            points.append(f"PEG {peg:.2f} — valuation roughly in line with growth")
         else:
-            score -= 12
-            points.append(f"P/E {pe:.1f} — expensive vs typical range")
+            score -= 8
+            points.append(f"PEG {peg:.2f} — rich even after accounting for growth")
+    elif pe:
+        if pe < 40:
+            points.append(f"P/E {pe:.1f} — no growth figure to weigh it against")
+        else:
+            score -= 5
+            points.append(f"P/E {pe:.1f} — high, and no PAT growth data to justify it")
+
+    # PAT growth ≥20% is the primary momentum-fundamental signal, weighted like ROE.
+    if pat_pct is not None:
+        if pat_pct >= 20:
+            score += 15
+            points.append(f"{pat_label} {pat_pct:.1f}% YoY — strong earnings momentum")
+        elif pat_pct >= 0:
+            points.append(f"{pat_label} {pat_pct:.1f}% YoY — modest earnings growth")
+        else:
+            score -= 13
+            points.append(f"{pat_label} {pat_pct:.1f}% YoY — earnings contracting")
+
     roe = f.get("roe")
     if roe is not None:
         roe_pct = roe * 100
@@ -306,31 +398,28 @@ def analyze_fundamental(f):
         else:
             score -= 13
             points.append(f"ROE {roe_pct:.1f}% — weak returns on equity")
+
     de = f.get("de")
-    if de is not None:
+    if de is not None and len(points) < 4:
         if de < 50:
-            score += 12
             points.append(f"Debt/Equity {de:.0f} — low leverage")
-        elif de < 150:
-            points.append(f"Debt/Equity {de:.0f} — moderate leverage")
-        else:
-            score -= 12
+        elif de >= 150:
+            score -= 8
             points.append(f"Debt/Equity {de:.0f} — high leverage risk")
-    rg = f.get("rev_growth")
-    if rg is not None:
-        rg_pct = rg * 100
-        if rg_pct >= 15:
-            score += 13
-            points.append(f"Revenue growth {rg_pct:.1f}% YoY — expanding fast")
-        elif rg_pct >= 0:
-            points.append(f"Revenue growth {rg_pct:.1f}% YoY — modest growth")
-        else:
-            score -= 13
-            points.append(f"Revenue growth {rg_pct:.1f}% YoY — contracting")
+
+    fii_dii = f.get("fii_dii_qoq")
+    if fii_dii is not None:
+        if fii_dii > 0.3:
+            score += 8
+            points.append(f"FII+DII holding up {fii_dii:+.2f}pp QoQ — institutions accumulating")
+        elif fii_dii < -0.3:
+            score -= 8
+            points.append(f"FII+DII holding down {fii_dii:+.2f}pp QoQ — institutions trimming")
+
     if not points:
         return None
     score = max(0, min(100, score))
-    return {"score": score, "points": points[:3]}
+    return {"score": score, "points": points[:4]}
 
 
 # --- SENTIMENT LEG (fully free: multi-source news RSS + keyword scoring) ---
@@ -428,14 +517,20 @@ def analyze_sentiment_free(company):
     return {"score": score, "points": points}, None
 
 
+WEIGHTS = {"fund": 0.35, "tech": 0.50, "sent": 0.15}
+
+
 def compute_verdict(fund, tech, sent, owned):
-    scores = [s["score"] for s in [fund, tech, sent] if s]
-    if not scores:
+    parts = {"fund": fund, "tech": tech, "sent": sent}
+    available = {k: v["score"] for k, v in parts.items() if v}
+    if not available:
         return None, None
-    composite = round(sum(scores) / len(scores), 1)
-    trend_broken = tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] < tech["ema50"]
+    total_w = sum(WEIGHTS[k] for k in available)
+    composite = round(sum(available[k] * WEIGHTS[k] for k in available) / total_w, 1)
+
+    trend_broken_2day = bool(tech and tech.get("two_day_break"))
     if owned:
-        verdict = "SELL" if (trend_broken or composite < 45) else "HOLD"
+        verdict = "SELL" if (trend_broken_2day or composite < 45) else "HOLD"
     else:
         # Hard gate: no BUY unless the full EMA stack holds (price > 50 > 150 >
         # 200), matching V-Momentum's stricter trend gate — a short-term dip
@@ -527,7 +622,7 @@ with tab_search:
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.markdown("**Fundamental**")
+                st.markdown("**Fundamental** (35% weight)")
                 if fund:
                     st.progress(fund["score"] / 100)
                     st.caption(f"{fund['score']}/100 · via {fund_raw.get('_source', 'Yahoo Finance')}")
@@ -545,29 +640,31 @@ with tab_search:
                         m_pe = st.number_input("P/E", min_value=0.0, value=0.0, step=0.5, key=f"m_pe_{ticker}")
                         m_roe = st.number_input("ROE %", min_value=0.0, value=0.0, step=0.5, key=f"m_roe_{ticker}")
                         m_de = st.number_input("Debt/Equity", min_value=0.0, value=0.0, step=1.0, key=f"m_de_{ticker}")
-                        m_rg = st.number_input("Revenue growth % YoY", value=0.0, step=0.5, key=f"m_rg_{ticker}")
+                        m_pat = st.number_input("PAT (profit) growth % YoY", value=0.0, step=0.5, key=f"m_pat_{ticker}")
+                        m_fdq = st.number_input("FII+DII holding change, pp QoQ (optional)", value=0.0, step=0.1, key=f"m_fdq_{ticker}")
                         if st.button("Save & use these", key=f"m_save_{ticker}"):
                             st.session_state[manual_key] = {
                                 "name": display_name, "sector": "N/A",
                                 "pe": m_pe or None, "roe": (m_roe / 100) if m_roe else None,
-                                "de": m_de or None, "rev_growth": (m_rg / 100) if m_rg else None,
+                                "de": m_de or None, "pat_growth": (m_pat / 100) if m_pat else None,
+                                "fii_dii_qoq": m_fdq or None,
                                 "_source": "manual entry",
                             }
                             st.rerun()
             with c2:
-                st.markdown("**Technical**")
+                st.markdown("**Technical** (50% weight)")
                 st.progress(tech["score"] / 100)
                 st.caption(f"{tech['score']}/100 · {tech['trend']}")
                 for p in tech["points"]:
                     st.write("• " + p)
             with c3:
-                st.markdown("**Sentiment**")
+                st.markdown("**Sentiment** (15% weight)")
                 if sent:
                     st.progress(sent.get("score", 0) / 100)
                     st.caption(f"{sent.get('score', 0)}/100 · keyword-based")
                     for p in sent.get("points", []):
                         st.write("• " + p)
-                    st.caption("⚠️ Headline keyword count, not real reasoning — e.g. won't know if a lawsuit was later dismissed.")
+                    st.caption("⚠️ Headline keyword count, not real reasoning — e.g. won't know if a lawsuit was later dismissed. FII/DII institutional flow (more reliable) is scored under Fundamental instead.")
                 else:
                     st.write(sent_err or "Unavailable")
 
