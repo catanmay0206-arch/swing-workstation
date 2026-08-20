@@ -305,6 +305,29 @@ def analyze_technical(df):
                 score += 10
                 points.append(f"Volume {vol_ratio:.1f}x the 20-day average — breakout has real participation")
 
+    # Extension / chasing-risk check: a perfect trend + fundamentals + sentiment
+    # read can still be a bad entry if the move already happened. A stock up
+    # 100%+ in 6 months, or trading far above its own 200-EMA, is a worse fresh
+    # entry than the same setup caught earlier — flag it explicitly rather than
+    # let a clean score hide how extended the price already is.
+    ret_6m = None
+    if len(close) >= 126:
+        base = float(close.iloc[-126])
+        if base:
+            ret_6m = ((price - base) / base) * 100
+    ext_pct = ((price - ema200) / ema200 * 100) if ema200 else None
+
+    if ret_6m is not None and ret_6m > 75:
+        score -= 15
+        points.append(f"Up {ret_6m:.0f}% in 6 months — already extended, chasing risk at CMP")
+    elif ret_6m is not None and ret_6m > 40:
+        score -= 8
+        points.append(f"Up {ret_6m:.0f}% in 6 months — stock has run hard, size cautiously")
+
+    if ext_pct is not None and ext_pct > 35:
+        score -= 8
+        points.append(f"{ext_pct:.0f}% above the 200-EMA — stretched, higher pullback risk")
+
     if len(points) < 3 and atr_pct is not None:
         points.append(f"ATR(14) {atr_pct:.1f}% of price — {'high' if atr_pct > 5 else 'moderate' if atr_pct > 2 else 'low'} daily volatility")
 
@@ -329,11 +352,13 @@ def analyze_technical(df):
     two_day_break = bool(len(close) >= 2 and close.iloc[-1] < ema50_series.iloc[-1] and close.iloc[-2] < ema50_series.iloc[-2])
 
     return {
-        "score": score, "points": points[:5], "price": round(price, 2),
+        "score": score, "points": points[:6], "price": round(price, 2),
         "ema50": round(ema50, 2), "ema150": round(ema150, 2) if ema150 else None,
         "ema200": round(ema200, 2) if ema200 else None,
         "rsi": round(rsi, 1) if rsi is not None else None, "atr_pct": atr_pct,
         "vol_ratio": round(vol_ratio, 2) if vol_ratio else None,
+        "ret_6m": round(ret_6m, 1) if ret_6m is not None else None,
+        "ext_pct": round(ext_pct, 1) if ext_pct is not None else None,
         "trend": trend, "full_stack": full_stack, "two_day_break": two_day_break,
     }
 
@@ -357,9 +382,11 @@ def analyze_fundamental(f):
     pat_label = "Revenue growth (PAT proxy)" if is_proxy else "PAT growth"
 
     # PEG (P/E ÷ growth rate) instead of a flat low-P/E preference — a rich P/E
-    # backed by fast PAT growth is a momentum leader, not a red flag. Falls back
-    # to a softer P/E-only read only when growth data isn't available at all.
-    if pe and pat_pct and pat_pct > 0:
+    # backed by fast PAT growth is a momentum leader, not a red flag. PEG is
+    # mathematically unstable near-zero growth (dividing by ~1% inflates it to
+    # absurd numbers regardless of how the stock actually looks), so below 5%
+    # growth it falls back to a plain P/E read instead of a misleading PEG figure.
+    if pe and pat_pct is not None and pat_pct >= 5:
         peg = pe / pat_pct
         if peg < 1.5:
             score += 14
@@ -370,8 +397,11 @@ def analyze_fundamental(f):
             score -= 8
             points.append(f"PEG {peg:.2f} — rich even after accounting for growth")
     elif pe:
-        if pe < 40:
-            points.append(f"P/E {pe:.1f} — no growth figure to weigh it against")
+        if pe < 25:
+            points.append(f"P/E {pe:.1f} — {pat_label.lower()} too flat for a meaningful PEG" if pat_pct is not None else f"P/E {pe:.1f} — no growth figure to weigh it against")
+        elif pe < 40:
+            score -= 4
+            points.append(f"P/E {pe:.1f} against {pat_label.lower()} of {pat_pct:.1f}% — paying up for very little growth" if pat_pct is not None else f"P/E {pe:.1f} — moderately rich, no growth figure to weigh it against")
         else:
             score -= 5
             points.append(f"P/E {pe:.1f} — high, and no PAT growth data to justify it")
@@ -435,6 +465,8 @@ NEGATIVE_WORDS = [
     "loss", "decline", "downgrade", "misses", "miss estimates", "probe", "fraud",
     "lawsuit", "scam", "fall", "plunge", "weak", "bearish", "default", "penalty",
     "crash", "sell-off", "concern", "raid", "resignation", "delay",
+    "drop", "drops", "dip", "dips", "shrink", "shrinks", "slip", "slips",
+    "slide", "slides", "tumble", "tumbles", "slump", "slumps", "erode", "erodes",
 ]
 # If any of these appear in the same headline as a negative word, treat that
 # headline's negative hits as resolved (neutral) instead of counting them down.
@@ -613,6 +645,10 @@ with tab_search:
                 st.markdown(f"## {emoji} {verdict}" + (f"  ·  composite {composite}/100" if composite else ""))
                 if verdict == "AVOID" and composite and composite >= 55 and tech and not tech.get("full_stack"):
                     st.caption("Composite alone would read BUY, but the EMA stack (50>150>200) isn't fully aligned — trend gate blocks new entries until it is, regardless of sentiment/fundamentals.")
+                if verdict == "BUY" and tech:
+                    ret_6m, ext_pct = tech.get("ret_6m"), tech.get("ext_pct")
+                    if (ret_6m and ret_6m > 60) or (ext_pct and ext_pct > 30):
+                        st.caption(f"⚠️ Chasing risk: {'up ' + str(ret_6m) + '% in 6 months' if ret_6m and ret_6m > 60 else ''}{' · ' if ret_6m and ret_6m > 60 and ext_pct and ext_pct > 30 else ''}{str(ext_pct) + '% above the 200-EMA' if ext_pct and ext_pct > 30 else ''} — the setup is real but the move has already happened. Consider waiting for a pullback toward the 50-EMA rather than entering at CMP.")
             else:
                 st.warning("Not enough data to form a verdict.")
 
