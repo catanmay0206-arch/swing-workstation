@@ -369,6 +369,33 @@ def analyze_technical(df):
     ema50_series = close.ewm(span=50, adjust=False).mean()
     two_day_break = bool(len(close) >= 2 and close.iloc[-1] < ema50_series.iloc[-1] and close.iloc[-2] < ema50_series.iloc[-2])
 
+    # --- Turnaround/value-play detection (separate lens from the momentum gate) ---
+    # A stock near its 52-week low will always fail the momentum trend gate —
+    # that's correct for a momentum entry, but it's a different question from
+    # "is this a beaten-down stock worth watching for a bounce". Computed here
+    # so the caller can decide whether to show it, without touching full_stack.
+    lookback = min(len(close), 252)
+    low_52w = float(close.iloc[-lookback:].min())
+    high_52w = float(close.iloc[-lookback:].max())
+    pct_above_52w_low = ((price - low_52w) / low_52w * 100) if low_52w else None
+    near_52w_low = bool(pct_above_52w_low is not None and pct_above_52w_low <= 20)
+
+    rsi_recovering = False
+    try:
+        if len(close) >= 20:
+            rsi_series = RSIIndicator(close, window=14).rsi()
+            rsi_recovering = bool(rsi_series.iloc[-10] < 40 and rsi_series.iloc[-1] > rsi_series.iloc[-10])
+    except Exception:
+        pass
+
+    higher_low = False
+    if len(close) >= 30:
+        recent_low = float(close.iloc[-10:].min())
+        prior_low = float(close.iloc[-30:-10].min())
+        higher_low = bool(recent_low > prior_low)
+
+    reversal_signal = rsi_recovering or higher_low
+
     return {
         "score": score, "points": points[:6], "price": round(price, 2),
         "ema50": round(ema50, 2), "ema150": round(ema150, 2) if ema150 else None,
@@ -379,6 +406,10 @@ def analyze_technical(df):
         "pct_above_low": round(pct_above_low, 1) if pct_above_low is not None else None,
         "ext_pct": round(ext_pct, 1) if ext_pct is not None else None,
         "trend": trend, "full_stack": full_stack, "two_day_break": two_day_break,
+        "low_52w": round(low_52w, 2), "high_52w": round(high_52w, 2),
+        "pct_above_52w_low": round(pct_above_52w_low, 1) if pct_above_52w_low is not None else None,
+        "near_52w_low": near_52w_low, "rsi_recovering": rsi_recovering,
+        "higher_low": higher_low, "reversal_signal": reversal_signal,
     }
 
 
@@ -575,20 +606,31 @@ def compute_verdict(fund, tech, sent, owned):
     parts = {"fund": fund, "tech": tech, "sent": sent}
     available = {k: v["score"] for k, v in parts.items() if v}
     if not available:
-        return None, None
+        return None, None, None
     total_w = sum(WEIGHTS[k] for k in available)
     composite = round(sum(available[k] * WEIGHTS[k] for k in available) / total_w, 1)
 
     trend_broken_2day = bool(tech and tech.get("two_day_break"))
+    basis = None
     if owned:
         verdict = "SELL" if (trend_broken_2day or composite < 45) else "HOLD"
     else:
-        # Hard gate: no BUY unless the full EMA stack holds (price > 50 > 150 >
-        # 200), matching V-Momentum's stricter trend gate — a short-term dip
-        # within a long-term uptrend no longer slips through on sentiment alone.
         full_stack = bool(tech and tech.get("full_stack"))
-        verdict = "BUY" if (composite >= 55 and full_stack) else "AVOID"
-    return composite, verdict
+        above_50ema = bool(tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] > tech["ema50"])
+        reversal_signal = bool(tech and tech.get("reversal_signal"))
+        fund_strong = bool(fund and fund.get("score", 0) >= 55)
+
+        if composite >= 55 and full_stack:
+            # Path A: momentum — matches V-Momentum's trend gate (price > 50>150>200).
+            verdict, basis = "BUY", "momentum"
+        elif composite >= 50 and above_50ema and reversal_signal and fund_strong:
+            # Path B: recovery — a beaten-down stock with strong fundamentals that
+            # has already turned (back above 50-EMA, confirmed reversal signal),
+            # not just a momentum leader. Different risk profile, still a real BUY.
+            verdict, basis = "BUY", "recovery"
+        else:
+            verdict = "AVOID"
+    return composite, verdict, basis
 
 
 def holding_hint(tech):
@@ -654,16 +696,28 @@ with tab_search:
                     display_name = fund_raw["name"]
                 sent, sent_err = analyze_sentiment_free(display_name)
 
-            composite, verdict = compute_verdict(fund, tech, sent, owned)
+            composite, verdict, basis = compute_verdict(fund, tech, sent, owned)
 
             st.subheader(f"{display_name} · {ticker}")
             st.caption(f"Last close ₹{tech['price']} · as of {datetime.now(IST).strftime('%d %b %Y')}")
 
             if verdict:
                 emoji = "🟢" if verdict in ("BUY", "HOLD") else "🔴"
-                st.markdown(f"## {emoji} {verdict}" + (f"  ·  composite {composite}/100" if composite else ""))
+                basis_label = ""
+                if verdict == "BUY" and basis == "momentum":
+                    basis_label = "  ·  Momentum"
+                elif verdict == "BUY" and basis == "recovery":
+                    basis_label = "  ·  Recovery play"
+                st.markdown(f"## {emoji} {verdict}{basis_label}" + (f"  ·  composite {composite}/100" if composite else ""))
+                if verdict == "BUY" and basis == "recovery" and tech:
+                    reasons = []
+                    if tech.get("rsi_recovering"):
+                        reasons.append("RSI recovering from oversold")
+                    if tech.get("higher_low"):
+                        reasons.append("higher low forming")
+                    st.caption(f"Not a full momentum stack — this is a confirmed bounce off the 52-week low (up {tech.get('pct_above_52w_low')}% from ₹{tech.get('low_52w')}), back above the 50-EMA, with {' and '.join(reasons)} plus strong fundamentals. Different risk profile than a momentum BUY — earlier stage, less confirmed.")
                 if verdict == "AVOID" and composite and composite >= 55 and tech and not tech.get("full_stack"):
-                    st.caption("Composite alone would read BUY, but the EMA stack (50>150>200) isn't fully aligned — trend gate blocks new entries until it is, regardless of sentiment/fundamentals.")
+                    st.caption("Composite alone would read BUY, but the EMA stack (50>150>200) isn't fully aligned, and it doesn't yet qualify as a confirmed recovery play either — trend gate blocks new entries until one of those is true.")
                 if verdict == "BUY" and tech:
                     ret_6m, pct_above_low, ext_pct = tech.get("ret_6m"), tech.get("pct_above_low"), tech.get("ext_pct")
                     run_candidates = [(v, l) for v, l in [(ret_6m, "up " + str(ret_6m) + "% in 6 months"), (pct_above_low, str(pct_above_low) + "% off the 6-month low")] if v and v > 60]
@@ -674,6 +728,20 @@ with tab_search:
                         flags.append(f"{ext_pct}% above the 200-EMA")
                     if flags:
                         st.caption(f"⚠️ Chasing risk: {' · '.join(flags)} — the setup is real but the move has already happened. Consider waiting for a pullback toward the 50-EMA rather than entering at CMP.")
+
+                if verdict == "AVOID" and not owned and tech and tech.get("near_52w_low") and fund and fund.get("score", 0) >= 50:
+                    st.markdown("---")
+                    st.markdown("#### 🔎 Turnaround Watch (separate from the momentum call above)")
+                    st.caption(f"Trading {tech.get('pct_above_52w_low')}% above its 52-week low of ₹{tech.get('low_52w')} (high: ₹{tech.get('high_52w')}), with fundamentals scoring {fund['score']}/100 — this fails the momentum trend gate by design, but may be a separate value/turnaround setup.")
+                    if tech.get("reversal_signal"):
+                        reasons = []
+                        if tech.get("rsi_recovering"):
+                            reasons.append("RSI recovering from oversold")
+                        if tech.get("higher_low"):
+                            reasons.append("recent higher low forming")
+                        st.markdown(f"🟡 **WATCH** — early reversal signs: {', '.join(reasons)}. Still not a momentum BUY, but worth tracking for a possible entry as the turn confirms.")
+                    else:
+                        st.markdown("⚪ **NOT YET** — near the 52-week low with decent fundamentals, but no reversal signal yet (RSI still falling, no higher low). Could still be a falling knife; wait for confirmation before entering.")
             else:
                 st.warning("Not enough data to form a verdict.")
 
