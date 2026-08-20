@@ -58,6 +58,7 @@ def fetch_history(ticker, period="15mo"):
 @st.cache_data(ttl=1800)
 def fetch_fundamentals(ticker):
     last_info = None
+    last_error = None
     for attempt in range(3):
         try:
             if _CFFI_AVAILABLE:
@@ -68,11 +69,14 @@ def fetch_fundamentals(ticker):
             if info and (info.get("shortName") or info.get("longName") or info.get("trailingPE") or info.get("returnOnEquity")):
                 last_info = info
                 break
-        except Exception:
-            pass
+            elif info is not None:
+                last_error = f"Response came back empty (keys: {len(info)})"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
         time.sleep(1.2)
     if not last_info:
-        return None
+        cffi_status = "available" if _CFFI_AVAILABLE else "NOT installed (import failed)"
+        return {"_error": True, "_detail": last_error or "unknown", "_cffi": cffi_status}
     return {
         "name": last_info.get("shortName") or last_info.get("longName") or ticker,
         "sector": last_info.get("sector", "N/A"),
@@ -156,6 +160,8 @@ def analyze_technical(df):
 # --- FUNDAMENTAL LEG (real, computed from yfinance ratios) ---
 def analyze_fundamental(f):
     if not f:
+        return None
+    if f.get("_error"):
         return None
     score = 50
     points = []
@@ -307,11 +313,15 @@ def compute_verdict(fund, tech, sent, owned):
     if not scores:
         return None, None
     composite = round(sum(scores) / len(scores), 1)
+    trend_broken = tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] < tech["ema50"]
+    long_trend_weak = tech and tech.get("trend") == "Below long-term trend"
     if owned:
-        trend_broken = tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] < tech["ema50"]
         verdict = "SELL" if (trend_broken or composite < 45) else "HOLD"
     else:
-        verdict = "BUY" if composite >= 55 else "AVOID"
+        # Hard gate: no BUY while price sits below its 200-EMA, regardless of how
+        # strong sentiment/fundamentals look — matches the trend-gate rule already
+        # used in V-Momentum (price > 200-DMA is mandatory, not just one input).
+        verdict = "BUY" if (composite >= 55 and not long_trend_weak) else "AVOID"
     return composite, verdict
 
 
@@ -368,9 +378,12 @@ with tab_search:
             with st.spinner("Pulling fundamentals and scanning recent news…"):
                 fund_raw = fetch_fundamentals(ticker)
                 fund = analyze_fundamental(fund_raw)
-                if fund_raw and fund_raw.get("name"):
+                fund_err = None
+                if fund_raw and fund_raw.get("_error"):
+                    fund_err = f"{fund_raw.get('_detail')} · curl_cffi: {fund_raw.get('_cffi')}"
+                elif fund_raw and fund_raw.get("name"):
                     display_name = fund_raw["name"]
-                sent, fs_err = analyze_sentiment_free(display_name)
+                sent, sent_err = analyze_sentiment_free(display_name)
 
             composite, verdict = compute_verdict(fund, tech, sent, owned)
 
@@ -380,6 +393,8 @@ with tab_search:
             if verdict:
                 emoji = "🟢" if verdict in ("BUY", "HOLD") else "🔴"
                 st.markdown(f"## {emoji} {verdict}" + (f"  ·  composite {composite}/100" if composite else ""))
+                if verdict == "AVOID" and composite and composite >= 55 and tech.get("trend") == "Below long-term trend":
+                    st.caption("Composite alone would read BUY, but price is below the 200-EMA — trend gate blocks new entries until that clears, regardless of sentiment/fundamentals.")
             else:
                 st.warning("Not enough data to form a verdict.")
 
@@ -396,7 +411,9 @@ with tab_search:
                     for p in fund["points"]:
                         st.write("• " + p)
                 else:
-                    st.write(fs_err or "Data unavailable")
+                    st.write("Data unavailable")
+                    if fund_err:
+                        st.caption(f"Debug: {fund_err}")
             with c2:
                 st.markdown("**Technical**")
                 st.progress(tech["score"] / 100)
@@ -412,7 +429,7 @@ with tab_search:
                         st.write("• " + p)
                     st.caption("⚠️ Headline keyword count, not real reasoning — e.g. won't know if a lawsuit was later dismissed.")
                 else:
-                    st.write(fs_err or "Unavailable")
+                    st.write(sent_err or "Unavailable")
 
             st.caption("Research/practice tool only — not investment advice. Verify independently before acting.")
 
