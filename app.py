@@ -4,11 +4,14 @@ import pandas as pd
 import requests
 import os
 import time
+import io
+import re
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
+from bs4 import BeautifulSoup
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -78,15 +81,77 @@ def fetch_fundamentals(ticker):
     except Exception as e:
         last_error = f"Yahoo {type(e).__name__}: {e}"
 
-    # Fallback: NSE India's own quote API — a different provider/rate-limit bucket
-    # than Yahoo, so it can succeed even when Yahoo is throttling. Gives fewer
-    # ratios (mainly sector/symbol P/E) but real, live, and free.
+    # Fallback 1: Screener.in's public company page — no login wall for viewing,
+    # richer data than NSE (P/E, ROE, ROCE, revenue growth), different provider
+    # entirely so it isn't affected by Yahoo's rate limit.
+    scr_data, scr_error = fetch_screener_fundamentals(ticker)
+    if scr_data:
+        return scr_data
+
+    # Fallback 2: NSE India's own quote API — yet another provider/rate-limit
+    # bucket. Gives fewer ratios (mainly P/E) but real, live, and free.
     nse_data, nse_error = fetch_nse_fundamentals(ticker)
     if nse_data:
         return nse_data
 
     cffi_status = "available" if _CFFI_AVAILABLE else "NOT installed (import failed)"
-    return {"_error": True, "_detail": f"{last_error} | NSE fallback: {nse_error} | curl_cffi: {cffi_status}"}
+    return {"_error": True, "_detail": f"{last_error} | Screener: {scr_error} | NSE: {nse_error} | curl_cffi: {cffi_status}"}
+
+
+def fetch_screener_fundamentals(ticker):
+    symbol = ticker.replace(".NS", "").replace(".BO", "")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+    for url in (f"https://www.screener.in/company/{symbol}/consolidated/", f"https://www.screener.in/company/{symbol}/"):
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            soup = BeautifulSoup(html, "html.parser")
+
+            name_tag = soup.find("h1")
+            name = name_tag.get_text(strip=True) if name_tag else symbol
+
+            ratios = {}
+            top_ratios = soup.find("ul", id="top-ratios")
+            if top_ratios:
+                for li in top_ratios.find_all("li"):
+                    name_span = li.find("span", class_="name")
+                    val_span = li.find("span", class_="value")
+                    if name_span and val_span:
+                        ratios[name_span.get_text(strip=True).lower()] = val_span.get_text(strip=True)
+
+            def parse_num(s):
+                if not s:
+                    return None
+                m = re.search(r"-?[\d,]+\.?\d*", s.replace(",", ""))
+                return float(m.group()) if m else None
+
+            pe = parse_num(ratios.get("stock p/e") or ratios.get("price to earning"))
+            roe = parse_num(ratios.get("roe"))
+            roce = parse_num(ratios.get("roce"))
+            de = parse_num(ratios.get("debt to equity"))
+
+            rev_growth = None
+            try:
+                for df in pd.read_html(io.StringIO(html)):
+                    if df.shape[1] == 2 and df.iloc[:, 0].astype(str).str.contains("3 Years", na=False).any():
+                        row = df[df.iloc[:, 0].astype(str).str.contains("3 Years", na=False)]
+                        rev_growth = parse_num(str(row.iloc[0, 1]))
+                        break  # first match in document order is Compounded Sales Growth
+            except Exception:
+                pass
+
+            if pe or roe or roce:
+                return {
+                    "name": name, "sector": "N/A",
+                    "pe": pe, "roe": (roe or roce) / 100 if (roe or roce) else None,
+                    "de": de, "rev_growth": (rev_growth / 100) if rev_growth is not None else None,
+                    "_source": "Screener.in",
+                }, None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+    return None, "No usable ratios found on page"
 
 
 def fetch_nse_fundamentals(ticker):
@@ -95,10 +160,15 @@ def fetch_nse_fundamentals(ticker):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
             "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=" + symbol,
+            "Connection": "keep-alive",
         }
         sess = requests.Session()
         sess.headers.update(headers)
         sess.get("https://www.nseindia.com", timeout=10)  # picks up required cookies
+        sess.get(f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}", timeout=10)  # look like a real visit
         resp = sess.get(f"https://www.nseindia.com/api/quote-equity?symbol={symbol}", timeout=10)
         if resp.status_code != 200:
             return None, f"HTTP {resp.status_code}"
@@ -408,14 +478,17 @@ with tab_search:
         else:
             tech = analyze_technical(hist)
             display_name = name_input
+            manual_key = f"manual_fund_{ticker}"
 
             with st.spinner("Pulling fundamentals and scanning recent news…"):
-                fund_raw = fetch_fundamentals(ticker)
+                if manual_key in st.session_state:
+                    fund_raw = st.session_state[manual_key]
+                    fund_err = None
+                else:
+                    fund_raw = fetch_fundamentals(ticker)
+                    fund_err = fund_raw.get("_detail") if (fund_raw and fund_raw.get("_error")) else None
                 fund = analyze_fundamental(fund_raw)
-                fund_err = None
-                if fund_raw and fund_raw.get("_error"):
-                    fund_err = fund_raw.get('_detail')
-                elif fund_raw and fund_raw.get("name"):
+                if fund_raw and fund_raw.get("name"):
                     display_name = fund_raw["name"]
                 sent, sent_err = analyze_sentiment_free(display_name)
 
@@ -444,10 +517,27 @@ with tab_search:
                     st.caption(f"{fund['score']}/100 · via {fund_raw.get('_source', 'Yahoo Finance')}")
                     for p in fund["points"]:
                         st.write("• " + p)
+                    if fund_raw.get("_source") == "manual entry" and st.button("Clear manual entry", key=f"m_clear_{ticker}"):
+                        del st.session_state[manual_key]
+                        st.rerun()
                 else:
                     st.write("Data unavailable")
                     if fund_err:
                         st.caption(f"Debug: {fund_err}")
+                    with st.expander("Enter manually instead"):
+                        st.caption("Look these up once (e.g. moneycontrol/screener.in) — reused automatically until you clear it.")
+                        m_pe = st.number_input("P/E", min_value=0.0, value=0.0, step=0.5, key=f"m_pe_{ticker}")
+                        m_roe = st.number_input("ROE %", min_value=0.0, value=0.0, step=0.5, key=f"m_roe_{ticker}")
+                        m_de = st.number_input("Debt/Equity", min_value=0.0, value=0.0, step=1.0, key=f"m_de_{ticker}")
+                        m_rg = st.number_input("Revenue growth % YoY", value=0.0, step=0.5, key=f"m_rg_{ticker}")
+                        if st.button("Save & use these", key=f"m_save_{ticker}"):
+                            st.session_state[manual_key] = {
+                                "name": display_name, "sector": "N/A",
+                                "pe": m_pe or None, "roe": (m_roe / 100) if m_roe else None,
+                                "de": m_de or None, "rev_growth": (m_rg / 100) if m_rg else None,
+                                "_source": "manual entry",
+                            }
+                            st.rerun()
             with c2:
                 st.markdown("**Technical**")
                 st.progress(tech["score"] / 100)
