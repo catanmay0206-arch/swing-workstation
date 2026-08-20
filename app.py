@@ -49,7 +49,7 @@ def resolve_ticker(query):
 
 # --- LIVE DATA FETCHING (no synthetic fallback — failures return None) ---
 @st.cache_data(ttl=900)
-def fetch_history(ticker, period="9mo"):
+def fetch_history(ticker, period="15mo"):
     try:
         df = yf.Ticker(ticker).history(period=period)
         if df is not None and not df.empty and len(df) >= 20:
@@ -61,20 +61,27 @@ def fetch_history(ticker, period="9mo"):
 
 @st.cache_data(ttl=1800)
 def fetch_fundamentals(ticker):
-    try:
-        info = yf.Ticker(ticker).info
-        if not info or not (info.get("shortName") or info.get("longName")):
-            return None
-        return {
-            "name": info.get("shortName") or info.get("longName") or ticker,
-            "sector": info.get("sector", "N/A"),
-            "pe": info.get("trailingPE"),
-            "roe": info.get("returnOnEquity"),
-            "de": info.get("debtToEquity"),
-            "rev_growth": info.get("revenueGrowth"),
-        }
-    except Exception:
+    import time
+    last_info = None
+    for attempt in range(3):
+        try:
+            info = yf.Ticker(ticker).info
+            if info and (info.get("shortName") or info.get("longName") or info.get("trailingPE") or info.get("returnOnEquity")):
+                last_info = info
+                break
+        except Exception:
+            pass
+        time.sleep(1.2)
+    if not last_info:
         return None
+    return {
+        "name": last_info.get("shortName") or last_info.get("longName") or ticker,
+        "sector": last_info.get("sector", "N/A"),
+        "pe": last_info.get("trailingPE"),
+        "roe": last_info.get("returnOnEquity"),
+        "de": last_info.get("debtToEquity"),
+        "rev_growth": last_info.get("revenueGrowth"),
+    }
 
 
 def compute_rsi(close_series, window=14):
@@ -130,6 +137,13 @@ def analyze_technical(df):
         elif rsi < 35:
             score -= 10
             points.append(f"RSI(14) {rsi:.0f} — weak momentum")
+        elif rsi > 70:
+            points.append(f"RSI(14) {rsi:.0f} — firm momentum, watch for overheating")
+        else:
+            points.append(f"RSI(14) {rsi:.0f} — flat/consolidating momentum")
+
+    if len(points) < 3 and atr_pct is not None:
+        points.append(f"ATR(14) {atr_pct:.1f}% of price — {'high' if atr_pct > 5 else 'moderate' if atr_pct > 2 else 'low'} daily volatility")
 
     score = max(0, min(100, score))
     trend = "Uptrend" if (ema200 and price > ema200) else ("Below long-term trend" if ema200 else "Limited history")
@@ -218,8 +232,8 @@ def analyze_sentiment(company, ticker, api_key):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 500,
+                "model": "claude-sonnet-5",
+                "max_tokens": 700,
                 "system": system,
                 "messages": [{"role": "user", "content": f"Sentiment read on {company} ({ticker})."}],
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}],
@@ -227,11 +241,13 @@ def analyze_sentiment(company, ticker, api_key):
             timeout=45,
         )
         data = resp.json()
+        if "error" in data:
+            return None, f"API error: {data['error'].get('message', str(data['error']))}"
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
         text = re.sub(r"^```json|^```|```$", "", text).strip()
         start, end = text.find("{"), text.rfind("}")
         if start == -1 or end == -1:
-            return None, "Sentiment response was empty or malformed."
+            return None, f"Sentiment response had no JSON (stop_reason: {data.get('stop_reason', 'unknown')})."
         parsed = json.loads(text[start:end + 1])
         return parsed, None
     except Exception as e:
