@@ -709,6 +709,35 @@ with tab_search:
                 elif verdict == "BUY" and basis == "recovery":
                     basis_label = "  ·  Recovery play"
                 st.markdown(f"## {emoji} {verdict}{basis_label}" + (f"  ·  composite {composite}/100" if composite else ""))
+
+                with st.expander("Why this verdict? — full checklist"):
+                    fw = int(WEIGHTS["fund"] * 100)
+                    tw = int(WEIGHTS["tech"] * 100)
+                    sw = int(WEIGHTS["sent"] * 100)
+                    st.markdown(f"**Composite** = Fundamental×{fw}% + Technical×{tw}% + Sentiment×{sw}% (reweighted if a leg is missing) → **{composite}/100**")
+                    def chk(ok):
+                        return "✅" if ok else "❌"
+                    if owned:
+                        two_day = bool(tech and tech.get("two_day_break"))
+                        st.markdown("**HOLD/SELL check (you own this):**")
+                        st.markdown(f"- {chk(not two_day)} Two consecutive closes above 50-EMA (no trend break)")
+                        st.markdown(f"- {chk(composite is not None and composite >= 45)} Composite ≥ 45")
+                        st.markdown(f"→ SELL fires if *either* fails. Otherwise HOLD.")
+                    else:
+                        full_stack = bool(tech and tech.get("full_stack"))
+                        above_50ema = bool(tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] > tech["ema50"])
+                        reversal = bool(tech and tech.get("reversal_signal"))
+                        fund_strong = bool(fund and fund.get("score", 0) >= 55)
+                        st.markdown("**Path A — Momentum BUY** (needs both):")
+                        st.markdown(f"- {chk(composite is not None and composite >= 55)} Composite ≥ 55")
+                        st.markdown(f"- {chk(full_stack)} Full EMA stack: price > 50-EMA > 150-EMA > 200-EMA")
+                        st.markdown("**Path B — Recovery BUY** (needs all four):")
+                        st.markdown(f"- {chk(composite is not None and composite >= 50)} Composite ≥ 50")
+                        st.markdown(f"- {chk(above_50ema)} Price back above 50-EMA")
+                        st.markdown(f"- {chk(reversal)} Reversal signal (RSI recovering from oversold, or higher low forming)")
+                        st.markdown(f"- {chk(fund_strong)} Fundamental score ≥ 55")
+                        st.markdown("→ **BUY** if Path A *or* Path B clears. Otherwise **AVOID** (Turnaround Watch may still show below if near the 52-week low).")
+
                 if verdict == "BUY" and basis == "recovery" and tech:
                     reasons = []
                     if tech.get("rsi_recovering"):
