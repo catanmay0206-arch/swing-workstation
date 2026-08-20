@@ -1,30 +1,26 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import requests
 import os
-import re
-import json
+import time
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _CFFI_AVAILABLE = True
+except ImportError:
+    _CFFI_AVAILABLE = False
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="V-Scout — Stock Analyzer", page_icon="📈", layout="centered")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 HOLDINGS_FILE = os.path.join(os.path.dirname(__file__), "data", "holdings.csv")
-
-
-def get_api_key():
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        return key
-    try:
-        return st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        return None
 
 
 # --- TICKER RESOLUTION ---
@@ -61,11 +57,14 @@ def fetch_history(ticker, period="15mo"):
 
 @st.cache_data(ttl=1800)
 def fetch_fundamentals(ticker):
-    import time
     last_info = None
     for attempt in range(3):
         try:
-            info = yf.Ticker(ticker).info
+            if _CFFI_AVAILABLE:
+                session = cffi_requests.Session(impersonate="chrome110")
+                info = yf.Ticker(ticker, session=session).info
+            else:
+                info = yf.Ticker(ticker).info
             if info and (info.get("shortName") or info.get("longName") or info.get("trailingPE") or info.get("returnOnEquity")):
                 last_info = info
                 break
@@ -208,50 +207,99 @@ def analyze_fundamental(f):
     return {"score": score, "points": points[:3]}
 
 
-# --- SENTIMENT LEG (only leg needing live web search -> Anthropic API) ---
-def analyze_sentiment(company, ticker, api_key):
-    if not api_key:
-        return None, "Sentiment needs ANTHROPIC_API_KEY set on this deployment."
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    system = (
-        "You are an equity research assistant covering Indian NSE stocks. Today's date is " + today_str + ". "
-        "Use web_search (at most 2 calls) to find the most recent news and analyst sentiment for "
-        + company + " (" + ticker + "), from roughly the last 4-8 weeks. "
-        "Before citing any legal or regulatory matter, check whether it has since been resolved or dismissed; "
-        "if so, say it's resolved rather than treating it as open. "
-        "Score sentiment 0-100 for a 3-6 month holding horizon. Give exactly 3 short points, each under 12 words, "
-        "paraphrased (never quoted verbatim), each ending with (Mon YYYY). "
-        'Respond with ONLY this JSON, single line, no markdown fences: {"score":0,"points":["","",""]}'
-    )
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-5",
-                "max_tokens": 700,
-                "system": system,
-                "messages": [{"role": "user", "content": f"Sentiment read on {company} ({ticker})."}],
-                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-            },
-            timeout=45,
-        )
-        data = resp.json()
-        if "error" in data:
-            return None, f"API error: {data['error'].get('message', str(data['error']))}"
-        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
-        text = re.sub(r"^```json|^```|```$", "", text).strip()
-        start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end == -1:
-            return None, f"Sentiment response had no JSON (stop_reason: {data.get('stop_reason', 'unknown')})."
-        parsed = json.loads(text[start:end + 1])
-        return parsed, None
-    except Exception as e:
-        return None, f"Sentiment fetch failed: {e}"
+# --- SENTIMENT LEG (fully free: multi-source news RSS + keyword scoring) ---
+# No API key, no cost. This is still keyword-counting, not real reasoning — but
+# RESOLUTION_WORDS below patches the single biggest failure mode: a headline like
+# "Lawsuit against X dismissed" now reads as resolved instead of scoring negative.
+POSITIVE_WORDS = [
+    "profit", "growth", "surge", "rally", "upgrade", "beats", "beat estimates",
+    "record", "expansion", "strong", "gain", "outperform", "bullish", "robust",
+    "jump", "rise", "soar", "wins", "order win", "buyback", "dividend hike",
+]
+NEGATIVE_WORDS = [
+    "loss", "decline", "downgrade", "misses", "miss estimates", "probe", "fraud",
+    "lawsuit", "scam", "fall", "plunge", "weak", "bearish", "default", "penalty",
+    "crash", "sell-off", "concern", "raid", "resignation", "delay",
+]
+# If any of these appear in the same headline as a negative word, treat that
+# headline's negative hits as resolved (neutral) instead of counting them down.
+RESOLUTION_WORDS = [
+    "dismissed", "cleared", "settled", "withdrawn", "resolved", "acquitted",
+    "closed the case", "dropped", "quashed", "exonerated",
+]
+
+NEWS_SOURCES = [
+    ("Google News", "https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"),
+    ("Bing News", "https://www.bing.com/news/search?q={q}&format=RSS"),
+]
+
+
+@st.cache_data(ttl=1800)
+def fetch_news_headlines(company, max_items=10):
+    queries = [f"{company} share OR stock NSE", f"{company} results", f"{company} news"]
+    seen_titles = set()
+    items = []
+    for name, url_tpl in NEWS_SOURCES:
+        for q in queries:
+            url = url_tpl.format(q=quote(q))
+            try:
+                resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item")[:max_items]:
+                    title_raw = item.findtext("title") or ""
+                    pub = item.findtext("pubDate") or ""
+                    if " - " in title_raw:
+                        title, source = title_raw.rsplit(" - ", 1)
+                    else:
+                        title, source = title_raw, name
+                    title = title.strip()
+                    key = title.lower()[:60]
+                    if not title or key in seen_titles:
+                        continue
+                    seen_titles.add(key)
+                    try:
+                        dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z")
+                        date_str = dt.strftime("%d %b %Y")
+                    except Exception:
+                        date_str = pub[:16]
+                    items.append({"title": title, "source": source.strip() or name, "date": date_str})
+            except Exception:
+                continue
+        if len(items) >= max_items * 2:
+            break
+    return items[:max_items * 2]
+
+
+def analyze_sentiment_free(company):
+    headlines = fetch_news_headlines(company)
+    if not headlines:
+        return None, "Could not fetch recent news headlines right now."
+
+    net = 0
+    scored = []
+    for h in headlines:
+        t = h["title"].lower()
+        pos_hits = sum(1 for w in POSITIVE_WORDS if w in t)
+        neg_hits = sum(1 for w in NEGATIVE_WORDS if w in t)
+        if neg_hits and any(w in t for w in RESOLUTION_WORDS):
+            pos_hits += neg_hits  # matter resolved — flip from negative to positive
+            neg_hits = 0
+        tone = pos_hits - neg_hits
+        net += tone
+        scored.append((tone, h))
+
+    score = max(0, min(100, round(50 + net * 5)))
+    scored.sort(key=lambda x: abs(x[0]), reverse=True)
+
+    points = []
+    for tone, h in scored[:3]:
+        tag = "🟢" if tone > 0 else ("🔴" if tone < 0 else "⚪")
+        points.append(f"{tag} {h['title']} ({h['date']})")
+    if not points:
+        points = [f"⚪ {h['title']} ({h['date']})" for h in headlines[:3]]
+
+    return {"score": score, "points": points}, None
 
 
 def compute_verdict(fund, tech, sent, owned):
@@ -294,11 +342,7 @@ def save_holdings(df):
 
 # --- UI ---
 st.title("📈 V·Scout")
-st.caption("Search a stock for a buy/avoid or hold/sell read, or manage your holdings. Research tool only — not investment advice.")
-
-api_key = get_api_key()
-if not api_key:
-    st.info("Sentiment analysis needs `ANTHROPIC_API_KEY` set as an environment variable/secret on this deployment. Fundamental and technical scores work without it.")
+st.caption("Search a stock for a buy/avoid or hold/sell read, or manage your holdings. 100% free data sources. Research tool only — not investment advice.")
 
 tab_search, tab_holdings = st.tabs(["🔍 Search & Analyze", "📁 My Holdings"])
 
@@ -311,21 +355,24 @@ with tab_search:
         entry_price = st.number_input("Your entry price (₹)", min_value=0.0, value=0.0, step=1.0)
 
     if st.button("Analyze", type="primary") and name_input.strip():
-        with st.spinner("Resolving ticker and pulling live data…"):
+        with st.spinner("Resolving ticker and pulling live price data…"):
             ticker = resolve_ticker(name_input)
             hist = fetch_history(ticker)
-            fund_raw = fetch_fundamentals(ticker)
 
         if hist is None:
             st.error(f"Could not fetch live price data for '{name_input}' (tried {ticker}). Check spelling, or try the exact NSE ticker (e.g. TITAGARH).")
         else:
             tech = analyze_technical(hist)
-            fund = analyze_fundamental(fund_raw)
-            with st.spinner("Checking latest news & sentiment…"):
-                sent, sent_err = analyze_sentiment((fund_raw or {}).get("name", name_input), ticker, api_key)
+            display_name = name_input
+
+            with st.spinner("Pulling fundamentals and scanning recent news…"):
+                fund_raw = fetch_fundamentals(ticker)
+                fund = analyze_fundamental(fund_raw)
+                if fund_raw and fund_raw.get("name"):
+                    display_name = fund_raw["name"]
+                sent, fs_err = analyze_sentiment_free(display_name)
 
             composite, verdict = compute_verdict(fund, tech, sent, owned)
-            display_name = (fund_raw or {}).get("name", name_input)
 
             st.subheader(f"{display_name} · {ticker}")
             st.caption(f"Last close ₹{tech['price']} · as of {datetime.now(IST).strftime('%d %b %Y')}")
@@ -349,7 +396,7 @@ with tab_search:
                     for p in fund["points"]:
                         st.write("• " + p)
                 else:
-                    st.write("Data unavailable")
+                    st.write(fs_err or "Data unavailable")
             with c2:
                 st.markdown("**Technical**")
                 st.progress(tech["score"] / 100)
@@ -360,11 +407,12 @@ with tab_search:
                 st.markdown("**Sentiment**")
                 if sent:
                     st.progress(sent.get("score", 0) / 100)
-                    st.caption(f"{sent.get('score', 0)}/100")
+                    st.caption(f"{sent.get('score', 0)}/100 · keyword-based")
                     for p in sent.get("points", []):
                         st.write("• " + p)
+                    st.caption("⚠️ Headline keyword count, not real reasoning — e.g. won't know if a lawsuit was later dismissed.")
                 else:
-                    st.write(sent_err or "Unavailable")
+                    st.write(fs_err or "Unavailable")
 
             st.caption("Research/practice tool only — not investment advice. Verify independently before acting.")
 
