@@ -315,14 +315,32 @@ def analyze_technical(df):
         base = float(close.iloc[-126])
         if base:
             ret_6m = ((price - base) / base) * 100
+
+    # % above the trailing 6-month low — catches round-trip recoveries (dip then
+    # rally back) that a start-to-now return can understate, since that window
+    # includes the dip itself. Takes whichever of the two shows more extension,
+    # rather than stacking both penalties for what's often the same underlying move.
+    pct_above_low = None
+    if len(close) >= 126:
+        low_6m = float(close.iloc[-126:].min())
+        if low_6m:
+            pct_above_low = ((price - low_6m) / low_6m) * 100
+
     ext_pct = ((price - ema200) / ema200 * 100) if ema200 else None
 
-    if ret_6m is not None and ret_6m > 75:
-        score -= 15
-        points.append(f"Up {ret_6m:.0f}% in 6 months — already extended, chasing risk at CMP")
-    elif ret_6m is not None and ret_6m > 40:
-        score -= 8
-        points.append(f"Up {ret_6m:.0f}% in 6 months — stock has run hard, size cautiously")
+    candidates = []
+    if ret_6m is not None:
+        candidates.append(("6-month return", ret_6m))
+    if pct_above_low is not None:
+        candidates.append(("gain off the 6-month low", pct_above_low))
+    if candidates:
+        label, val = max(candidates, key=lambda x: x[1])
+        if val > 75:
+            score -= 15
+            points.append(f"{label.capitalize()} {val:.0f}% — already extended, chasing risk at CMP")
+        elif val > 40:
+            score -= 8
+            points.append(f"{label.capitalize()} {val:.0f}% — stock has run hard, size cautiously")
 
     if ext_pct is not None and ext_pct > 35:
         score -= 8
@@ -358,6 +376,7 @@ def analyze_technical(df):
         "rsi": round(rsi, 1) if rsi is not None else None, "atr_pct": atr_pct,
         "vol_ratio": round(vol_ratio, 2) if vol_ratio else None,
         "ret_6m": round(ret_6m, 1) if ret_6m is not None else None,
+        "pct_above_low": round(pct_above_low, 1) if pct_above_low is not None else None,
         "ext_pct": round(ext_pct, 1) if ext_pct is not None else None,
         "trend": trend, "full_stack": full_stack, "two_day_break": two_day_break,
     }
@@ -646,9 +665,15 @@ with tab_search:
                 if verdict == "AVOID" and composite and composite >= 55 and tech and not tech.get("full_stack"):
                     st.caption("Composite alone would read BUY, but the EMA stack (50>150>200) isn't fully aligned — trend gate blocks new entries until it is, regardless of sentiment/fundamentals.")
                 if verdict == "BUY" and tech:
-                    ret_6m, ext_pct = tech.get("ret_6m"), tech.get("ext_pct")
-                    if (ret_6m and ret_6m > 60) or (ext_pct and ext_pct > 30):
-                        st.caption(f"⚠️ Chasing risk: {'up ' + str(ret_6m) + '% in 6 months' if ret_6m and ret_6m > 60 else ''}{' · ' if ret_6m and ret_6m > 60 and ext_pct and ext_pct > 30 else ''}{str(ext_pct) + '% above the 200-EMA' if ext_pct and ext_pct > 30 else ''} — the setup is real but the move has already happened. Consider waiting for a pullback toward the 50-EMA rather than entering at CMP.")
+                    ret_6m, pct_above_low, ext_pct = tech.get("ret_6m"), tech.get("pct_above_low"), tech.get("ext_pct")
+                    run_candidates = [(v, l) for v, l in [(ret_6m, "up " + str(ret_6m) + "% in 6 months"), (pct_above_low, str(pct_above_low) + "% off the 6-month low")] if v and v > 60]
+                    flags = []
+                    if run_candidates:
+                        flags.append(max(run_candidates, key=lambda x: x[0])[1])
+                    if ext_pct and ext_pct > 30:
+                        flags.append(f"{ext_pct}% above the 200-EMA")
+                    if flags:
+                        st.caption(f"⚠️ Chasing risk: {' · '.join(flags)} — the setup is real but the move has already happened. Consider waiting for a pullback toward the 50-EMA rather than entering at CMP.")
             else:
                 st.warning("Not enough data to form a verdict.")
 
