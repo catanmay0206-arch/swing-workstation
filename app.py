@@ -246,6 +246,7 @@ def compute_atr_pct(df, window=14):
 def analyze_technical(df):
     close = df["Close"]
     price = float(close.iloc[-1])
+    ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1]) if len(close) >= 20 else None
     ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
     ema150 = float(close.ewm(span=150, adjust=False).mean().iloc[-1]) if len(close) >= 150 else None
     ema200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close) >= 200 else None
@@ -406,7 +407,7 @@ def analyze_technical(df):
         "pct_above_low": round(pct_above_low, 1) if pct_above_low is not None else None,
         "ext_pct": round(ext_pct, 1) if ext_pct is not None else None,
         "trend": trend, "full_stack": full_stack, "two_day_break": two_day_break,
-        "low_52w": round(low_52w, 2), "high_52w": round(high_52w, 2),
+        "low_52w": round(low_52w, 2), "high_52w": round(high_52w, 2), "ema20": round(ema20, 2) if ema20 else None,
         "pct_above_52w_low": round(pct_above_52w_low, 1) if pct_above_52w_low is not None else None,
         "near_52w_low": near_52w_low, "rsi_recovering": rsi_recovering,
         "higher_low": higher_low, "reversal_signal": reversal_signal,
@@ -610,26 +611,42 @@ def compute_verdict(fund, tech, sent, owned):
     total_w = sum(WEIGHTS[k] for k in available)
     composite = round(sum(available[k] * WEIGHTS[k] for k in available) / total_w, 1)
 
-    trend_broken_2day = bool(tech and tech.get("two_day_break"))
     basis = None
     if owned:
-        verdict = "SELL" if (trend_broken_2day or composite < 45) else "HOLD"
-    else:
-        full_stack = bool(tech and tech.get("full_stack"))
-        above_50ema = bool(tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] > tech["ema50"])
-        reversal_signal = bool(tech and tech.get("reversal_signal"))
-        fund_strong = bool(fund and fund.get("score", 0) >= 55)
-
-        if composite >= 55 and full_stack:
-            # Path A: momentum — matches V-Momentum's trend gate (price > 50>150>200).
-            verdict, basis = "BUY", "momentum"
-        elif composite >= 50 and above_50ema and reversal_signal and fund_strong:
-            # Path B: recovery — a beaten-down stock with strong fundamentals that
-            # has already turned (back above 50-EMA, confirmed reversal signal),
-            # not just a momentum leader. Different risk profile, still a real BUY.
-            verdict, basis = "BUY", "recovery"
+        two_day_break = bool(tech and tech.get("two_day_break"))
+        if two_day_break or composite < 45:
+            verdict = "SELL"
         else:
-            verdict = "AVOID"
+            verdict = "HOLD"
+        return composite, verdict, basis
+
+    # --- Path A: Stage-2 Momentum ---
+    full_stack = bool(tech and tech.get("full_stack"))
+    price, ema50 = (tech.get("price"), tech.get("ema50")) if tech else (None, None)
+    safety_ratio = (price / ema50) if (price and ema50) else None
+    path_a_safety = bool(safety_ratio is not None and safety_ratio <= 1.15)
+    path_a_pass = full_stack and path_a_safety
+
+    # --- Path B: Value Turnaround ---
+    pct_above_low = tech.get("pct_above_52w_low") if tech else None
+    path_b_rebound = bool(pct_above_low is not None and 15 <= pct_above_low <= 30)
+    ema20 = tech.get("ema20") if tech else None
+    path_b_shift = bool(price and ema20 and ema50 and price > ema20 and price > ema50)
+    de = fund.get("de") if fund else None
+    roe = fund.get("roe") if fund else None
+    path_b_quality = bool(de is not None and de < 50 and roe is not None and roe >= 0.15)
+    path_b_pass = path_b_rebound and path_b_shift and path_b_quality
+
+    if composite >= 55 and (path_a_pass or path_b_pass):
+        verdict = "BUY"
+        basis = "momentum" if path_a_pass else "recovery"
+    elif composite >= 55 and full_stack and not path_a_safety:
+        # Vertical run: trend qualifies but price has run too far above the
+        # 50-EMA to be a safe fresh entry — wait for a pullback near 20/50-EMA.
+        verdict = "AVOID_OVEREXTENDED"
+    else:
+        verdict = "AVOID"
+
     return composite, verdict, basis
 
 
@@ -703,12 +720,16 @@ with tab_search:
 
             if verdict:
                 emoji = "🟢" if verdict in ("BUY", "HOLD") else "🔴"
+                verdict_label = "AVOID (OVEREXTENDED)" if verdict == "AVOID_OVEREXTENDED" else verdict
                 basis_label = ""
                 if verdict == "BUY" and basis == "momentum":
-                    basis_label = "  ·  Momentum"
+                    basis_label = "  ·  Stage-2 Momentum"
                 elif verdict == "BUY" and basis == "recovery":
-                    basis_label = "  ·  Recovery play"
-                st.markdown(f"## {emoji} {verdict}{basis_label}" + (f"  ·  composite {composite}/100" if composite else ""))
+                    basis_label = "  ·  Value Turnaround"
+                st.markdown(f"## {emoji} {verdict_label}{basis_label}" + (f"  ·  composite {composite}/100" if composite else ""))
+                if verdict == "AVOID_OVEREXTENDED" and tech and tech.get("ema50"):
+                    ratio = tech["price"] / tech["ema50"]
+                    st.caption(f"⚠️ Trend qualifies (full EMA stack), but price is {(ratio-1)*100:.0f}% above the 50-EMA — beyond the 15% safety limit for a fresh entry. Wait for a pullback toward the 20/50-EMA rather than buying here.")
 
                 with st.expander("Why this verdict? — full checklist"):
                     fw = int(WEIGHTS["fund"] * 100)
@@ -720,23 +741,29 @@ with tab_search:
                     if owned:
                         two_day = bool(tech and tech.get("two_day_break"))
                         st.markdown("**HOLD/SELL check (you own this):**")
-                        st.markdown(f"- {chk(not two_day)} Two consecutive closes above 50-EMA (no trend break)")
+                        st.markdown(f"- {chk(not two_day)} No two consecutive closes below 50-EMA")
                         st.markdown(f"- {chk(composite is not None and composite >= 45)} Composite ≥ 45")
-                        st.markdown(f"→ SELL fires if *either* fails. Otherwise HOLD.")
+                        st.markdown("→ SELL if *either* fails. Otherwise HOLD.")
                     else:
                         full_stack = bool(tech and tech.get("full_stack"))
-                        above_50ema = bool(tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] > tech["ema50"])
-                        reversal = bool(tech and tech.get("reversal_signal"))
-                        fund_strong = bool(fund and fund.get("score", 0) >= 55)
-                        st.markdown("**Path A — Momentum BUY** (needs both):")
-                        st.markdown(f"- {chk(composite is not None and composite >= 55)} Composite ≥ 55")
+                        price, ema50, ema20 = (tech.get("price"), tech.get("ema50"), tech.get("ema20")) if tech else (None, None, None)
+                        safety_ratio = (price / ema50) if (price and ema50) else None
+                        path_a_safety = bool(safety_ratio is not None and safety_ratio <= 1.15)
+                        pct_above_low = tech.get("pct_above_52w_low") if tech else None
+                        path_b_rebound = bool(pct_above_low is not None and 15 <= pct_above_low <= 30)
+                        path_b_shift = bool(price and ema20 and ema50 and price > ema20 and price > ema50)
+                        de = fund.get("de") if fund else None
+                        roe = fund.get("roe") if fund else None
+                        path_b_quality = bool(de is not None and de < 50 and roe is not None and roe >= 0.15)
+                        st.markdown(f"**Composite ≥ 55:** {chk(composite is not None and composite >= 55)}")
+                        st.markdown("**Path A — Stage-2 Momentum** (needs both):")
                         st.markdown(f"- {chk(full_stack)} Full EMA stack: price > 50-EMA > 150-EMA > 200-EMA")
-                        st.markdown("**Path B — Recovery BUY** (needs all four):")
-                        st.markdown(f"- {chk(composite is not None and composite >= 50)} Composite ≥ 50")
-                        st.markdown(f"- {chk(above_50ema)} Price back above 50-EMA")
-                        st.markdown(f"- {chk(reversal)} Reversal signal (RSI recovering from oversold, or higher low forming)")
-                        st.markdown(f"- {chk(fund_strong)} Fundamental score ≥ 55")
-                        st.markdown("→ **BUY** if Path A *or* Path B clears. Otherwise **AVOID** (Turnaround Watch may still show below if near the 52-week low).")
+                        st.markdown(f"- {chk(path_a_safety)} Price ≤ 1.15× the 50-EMA (not overextended){' — ratio ' + f'{safety_ratio:.2f}x' if safety_ratio else ''}")
+                        st.markdown("**Path B — Value Turnaround** (needs all three):")
+                        st.markdown(f"- {chk(path_b_rebound)} 15–30% above the 52-week low{' — currently ' + str(pct_above_low) + '%' if pct_above_low is not None else ''}")
+                        st.markdown(f"- {chk(path_b_shift)} Price above both the 20-EMA and 50-EMA")
+                        st.markdown(f"- {chk(path_b_quality)} D/E < 0.50 and ROE ≥ 15%")
+                        st.markdown("→ **BUY** if composite ≥ 55 AND (Path A or Path B clears). **AVOID (OVEREXTENDED)** if composite ≥ 55, full stack holds, but the 1.15× safety limit fails. Otherwise **AVOID**.")
 
                 if verdict == "BUY" and basis == "recovery" and tech:
                     reasons = []
