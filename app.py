@@ -55,36 +55,70 @@ def fetch_history(ticker, period="15mo"):
     return None
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=86400)  # fundamentals barely move intraday — cache a full day, hit Yahoo far less
 def fetch_fundamentals(ticker):
-    last_info = None
     last_error = None
-    for attempt in range(3):
-        try:
-            if _CFFI_AVAILABLE:
-                session = cffi_requests.Session(impersonate="chrome110")
-                info = yf.Ticker(ticker, session=session).info
-            else:
-                info = yf.Ticker(ticker).info
-            if info and (info.get("shortName") or info.get("longName") or info.get("trailingPE") or info.get("returnOnEquity")):
-                last_info = info
-                break
-            elif info is not None:
-                last_error = f"Response came back empty (keys: {len(info)})"
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-        time.sleep(1.2)
-    if not last_info:
-        cffi_status = "available" if _CFFI_AVAILABLE else "NOT installed (import failed)"
-        return {"_error": True, "_detail": last_error or "unknown", "_cffi": cffi_status}
-    return {
-        "name": last_info.get("shortName") or last_info.get("longName") or ticker,
-        "sector": last_info.get("sector", "N/A"),
-        "pe": last_info.get("trailingPE"),
-        "roe": last_info.get("returnOnEquity"),
-        "de": last_info.get("debtToEquity"),
-        "rev_growth": last_info.get("revenueGrowth"),
-    }
+    try:
+        if _CFFI_AVAILABLE:
+            session = cffi_requests.Session(impersonate="chrome110")
+            info = yf.Ticker(ticker, session=session).info
+        else:
+            info = yf.Ticker(ticker).info
+        if info and (info.get("shortName") or info.get("longName") or info.get("trailingPE") or info.get("returnOnEquity")):
+            return {
+                "name": info.get("shortName") or info.get("longName") or ticker,
+                "sector": info.get("sector", "N/A"),
+                "pe": info.get("trailingPE"),
+                "roe": info.get("returnOnEquity"),
+                "de": info.get("debtToEquity"),
+                "rev_growth": info.get("revenueGrowth"),
+                "_source": "Yahoo Finance",
+            }
+        last_error = f"Yahoo response empty (keys: {len(info) if info else 0})"
+    except Exception as e:
+        last_error = f"Yahoo {type(e).__name__}: {e}"
+
+    # Fallback: NSE India's own quote API — a different provider/rate-limit bucket
+    # than Yahoo, so it can succeed even when Yahoo is throttling. Gives fewer
+    # ratios (mainly sector/symbol P/E) but real, live, and free.
+    nse_data, nse_error = fetch_nse_fundamentals(ticker)
+    if nse_data:
+        return nse_data
+
+    cffi_status = "available" if _CFFI_AVAILABLE else "NOT installed (import failed)"
+    return {"_error": True, "_detail": f"{last_error} | NSE fallback: {nse_error} | curl_cffi: {cffi_status}"}
+
+
+def fetch_nse_fundamentals(ticker):
+    symbol = ticker.replace(".NS", "").replace(".BO", "")
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept": "application/json",
+        }
+        sess = requests.Session()
+        sess.headers.update(headers)
+        sess.get("https://www.nseindia.com", timeout=10)  # picks up required cookies
+        resp = sess.get(f"https://www.nseindia.com/api/quote-equity?symbol={symbol}", timeout=10)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        data = resp.json()
+        meta = data.get("metadata", {}) or {}
+        info = data.get("info", {}) or {}
+        pe = meta.get("pdSymbolPe")
+        if pe is None and info.get("companyName") is None:
+            return None, "No usable fields in response"
+        return {
+            "name": info.get("companyName", symbol),
+            "sector": info.get("industry", "N/A"),
+            "pe": pe,
+            "roe": None,
+            "de": None,
+            "rev_growth": None,
+            "_source": "NSE India (limited ratios)",
+        }, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def compute_rsi(close_series, window=14):
@@ -380,7 +414,7 @@ with tab_search:
                 fund = analyze_fundamental(fund_raw)
                 fund_err = None
                 if fund_raw and fund_raw.get("_error"):
-                    fund_err = f"{fund_raw.get('_detail')} · curl_cffi: {fund_raw.get('_cffi')}"
+                    fund_err = fund_raw.get('_detail')
                 elif fund_raw and fund_raw.get("name"):
                     display_name = fund_raw["name"]
                 sent, sent_err = analyze_sentiment_free(display_name)
@@ -407,7 +441,7 @@ with tab_search:
                 st.markdown("**Fundamental**")
                 if fund:
                     st.progress(fund["score"] / 100)
-                    st.caption(f"{fund['score']}/100")
+                    st.caption(f"{fund['score']}/100 · via {fund_raw.get('_source', 'Yahoo Finance')}")
                     for p in fund["points"]:
                         st.write("• " + p)
                 else:
