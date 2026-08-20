@@ -213,6 +213,7 @@ def analyze_technical(df):
     close = df["Close"]
     price = float(close.iloc[-1])
     ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+    ema150 = float(close.ewm(span=150, adjust=False).mean().iloc[-1]) if len(close) >= 150 else None
     ema200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close) >= 200 else None
     rsi = compute_rsi(close)
     atr_pct = compute_atr_pct(df)
@@ -253,11 +254,26 @@ def analyze_technical(df):
         points.append(f"ATR(14) {atr_pct:.1f}% of price — {'high' if atr_pct > 5 else 'moderate' if atr_pct > 2 else 'low'} daily volatility")
 
     score = max(0, min(100, score))
-    trend = "Uptrend" if (ema200 and price > ema200) else ("Below long-term trend" if ema200 else "Limited history")
+
+    # Full stack matches V-Momentum's trend gate: price > 50-EMA > 150-EMA > 200-EMA.
+    full_stack = bool(ema150 and ema200 and price > ema50 > ema150 > ema200)
+    if ema150 and ema200:
+        if full_stack:
+            trend = "Full uptrend stack (50>150>200)"
+        elif price > ema200:
+            trend = "Long-term up, short-term pullback"
+        else:
+            trend = "Below long-term trend"
+        points.append(f"50-EMA {'>' if ema50 > ema150 else '<'} 150-EMA {'>' if ema150 > ema200 else '<'} 200-EMA — {'stacked' if full_stack else 'not fully stacked'}")
+    else:
+        trend = "Limited history"
+
     return {
-        "score": score, "points": points[:3], "price": round(price, 2),
-        "ema50": round(ema50, 2), "ema200": round(ema200, 2) if ema200 else None,
-        "rsi": round(rsi, 1) if rsi is not None else None, "atr_pct": atr_pct, "trend": trend,
+        "score": score, "points": points[:4], "price": round(price, 2),
+        "ema50": round(ema50, 2), "ema150": round(ema150, 2) if ema150 else None,
+        "ema200": round(ema200, 2) if ema200 else None,
+        "rsi": round(rsi, 1) if rsi is not None else None, "atr_pct": atr_pct,
+        "trend": trend, "full_stack": full_stack,
     }
 
 
@@ -418,14 +434,14 @@ def compute_verdict(fund, tech, sent, owned):
         return None, None
     composite = round(sum(scores) / len(scores), 1)
     trend_broken = tech and tech.get("price") is not None and tech.get("ema50") is not None and tech["price"] < tech["ema50"]
-    long_trend_weak = tech and tech.get("trend") == "Below long-term trend"
     if owned:
         verdict = "SELL" if (trend_broken or composite < 45) else "HOLD"
     else:
-        # Hard gate: no BUY while price sits below its 200-EMA, regardless of how
-        # strong sentiment/fundamentals look — matches the trend-gate rule already
-        # used in V-Momentum (price > 200-DMA is mandatory, not just one input).
-        verdict = "BUY" if (composite >= 55 and not long_trend_weak) else "AVOID"
+        # Hard gate: no BUY unless the full EMA stack holds (price > 50 > 150 >
+        # 200), matching V-Momentum's stricter trend gate — a short-term dip
+        # within a long-term uptrend no longer slips through on sentiment alone.
+        full_stack = bool(tech and tech.get("full_stack"))
+        verdict = "BUY" if (composite >= 55 and full_stack) else "AVOID"
     return composite, verdict
 
 
@@ -500,8 +516,8 @@ with tab_search:
             if verdict:
                 emoji = "🟢" if verdict in ("BUY", "HOLD") else "🔴"
                 st.markdown(f"## {emoji} {verdict}" + (f"  ·  composite {composite}/100" if composite else ""))
-                if verdict == "AVOID" and composite and composite >= 55 and tech.get("trend") == "Below long-term trend":
-                    st.caption("Composite alone would read BUY, but price is below the 200-EMA — trend gate blocks new entries until that clears, regardless of sentiment/fundamentals.")
+                if verdict == "AVOID" and composite and composite >= 55 and tech and not tech.get("full_stack"):
+                    st.caption("Composite alone would read BUY, but the EMA stack (50>150>200) isn't fully aligned — trend gate blocks new entries until it is, regardless of sentiment/fundamentals.")
             else:
                 st.warning("Not enough data to form a verdict.")
 
